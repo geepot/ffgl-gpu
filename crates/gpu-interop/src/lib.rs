@@ -11,10 +11,7 @@ pub use bridge::GpuBridge;
 // These modules will be populated in subsequent tasks.
 
 #[cfg(target_os = "macos")]
-pub mod metal {
-    //! Metal bridge implementation (macOS via IOSurface).
-    //! To be implemented in Task 7.
-}
+pub mod metal;
 
 #[cfg(target_os = "windows")]
 pub mod dx11 {

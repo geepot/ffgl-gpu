@@ -35,9 +35,9 @@ num-traits = "0.2"
 # macOS Metal
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLTexture", "MTLBuffer", "MTLResource", "MTLRenderPipeline", "MTLRenderCommandEncoder", "MTLRenderPass"] }
-objc2-io-surface = "0.3"
-objc2-open-gl = "0.3"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLTexture", "MTLBuffer", "MTLResource", "MTLRenderPipeline", "MTLRenderCommandEncoder", "MTLRenderPass", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "objc2-core-foundation"] }
+objc2-open-gl = { version = "0.3", features = ["IOSurface", "CGLTypes", "CGLCurrent"] }
 objc2-core-foundation = "0.3"
 dispatch2 = "0.3"
 
