@@ -4,6 +4,10 @@ members = [
     "crates/ffgl-glium",
     "crates/gpu-interop",
     "crates/ffgl-gpu",
+    "examples/passthrough",
+    "examples/invert",
+    "examples/blur",
+    "examples/kitchen-sink",
 ]
 resolver = "2"
 

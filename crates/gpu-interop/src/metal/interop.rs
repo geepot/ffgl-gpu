@@ -296,6 +296,14 @@ impl GlMetalBridge {
 // ---------------------------------------------------------------------------
 
 impl GpuBridge for GlMetalBridge {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn ensure_dimensions(&mut self, width: u32, height: u32) -> Result<()> {
         if self.dimensions == (width, height)
             && self.pairs[0].is_some()

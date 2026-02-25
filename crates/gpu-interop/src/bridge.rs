@@ -12,6 +12,12 @@ use gl::types::GLuint;
 /// rendering. Input textures receive data from the host's OpenGL FBO, and output
 /// textures hold processed results to blit back.
 pub trait GpuBridge {
+    /// Downcast to a concrete type. Used by plugins to access platform-specific
+    /// texture handles (e.g. `GlMetalBridge::input_metal_texture()`).
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Mutable downcast to a concrete type.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     /// Recreate shared textures if dimensions changed.
     fn ensure_dimensions(&mut self, width: u32, height: u32) -> Result<()>;
 

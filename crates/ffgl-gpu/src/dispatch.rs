@@ -363,6 +363,79 @@ mod metal_impl {
                 command_buffer: pass.command_buffer,
             }
         }
+
+        /// Dispatch a fullscreen render pass: renders a quad using the given
+        /// render pipeline with the output texture as the render target and
+        /// input textures bound to fragment shader slots.
+        ///
+        /// Returns a [`PendingWork`] token for synchronization.
+        pub fn dispatch_render(
+            &self,
+            pipeline: &RenderPipeline,
+            output_texture: &ProtocolObject<dyn MTLTexture>,
+            fragment_textures: &[&ProtocolObject<dyn MTLTexture>],
+            fragment_bytes: &[(&[u8], usize)],
+        ) -> Result<PendingWork> {
+            let command_buffer = self
+                .device
+                .command_queue()
+                .commandBuffer()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create command buffer for render"))?;
+
+            let render_desc = MTLRenderPassDescriptor::new();
+            {
+                let attachment = unsafe {
+                    render_desc
+                        .colorAttachments()
+                        .objectAtIndexedSubscript(0)
+                };
+                attachment.setTexture(Some(output_texture));
+                attachment.setLoadAction(MTLLoadAction::DontCare);
+                attachment.setStoreAction(MTLStoreAction::Store);
+            }
+
+            let encoder = command_buffer
+                .renderCommandEncoderWithDescriptor(&render_desc)
+                .ok_or_else(|| anyhow::anyhow!("Failed to create render encoder"))?;
+
+            encoder.setRenderPipelineState(&pipeline.state);
+
+            // Bind fullscreen quad vertex buffer at index 0
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(Some(&pipeline.quad_vb), 0, 0);
+            }
+
+            // Bind fragment textures
+            for (i, tex) in fragment_textures.iter().enumerate() {
+                unsafe {
+                    encoder.setFragmentTexture_atIndex(Some(*tex), i);
+                }
+            }
+
+            // Bind fragment constant data
+            for (data, index) in fragment_bytes {
+                unsafe {
+                    encoder.setFragmentBytes_length_atIndex(
+                        std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
+                        data.len(),
+                        *index,
+                    );
+                }
+            }
+
+            // Draw fullscreen quad as triangle strip (4 vertices)
+            unsafe {
+                encoder
+                    .drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+            }
+
+            encoder.endEncoding();
+            command_buffer.commit();
+
+            Ok(PendingWork {
+                command_buffer,
+            })
+        }
     }
 }
 
