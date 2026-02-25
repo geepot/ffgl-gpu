@@ -8,5 +8,15 @@ ffgl-core = { workspace = true }
 ffgl-glium = { workspace = true }
 gpu-interop = { workspace = true }
 gl = { workspace = true }
+glium = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+dispatch2 = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
