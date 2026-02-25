@@ -714,17 +714,17 @@ impl GpuBridge for GlDx11Bridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    ) {
+    ) -> bool {
         let back = 1 - self.front;
         let output_gl = match &self.pairs[back] {
             Some(pair) => pair.output.gl_texture,
-            None => return,
+            None => return false,
         };
 
         // Lock back output for GL access
         if unsafe { !self.lock_gl_texture_back_output() } {
             warn!("Failed to lock back output GL texture for blit");
-            return;
+            return false;
         }
 
         unsafe {
@@ -761,6 +761,7 @@ impl GpuBridge for GlDx11Bridge {
 
             self.unlock_gl_texture_back_output();
         }
+        true
     }
 
     fn blit_output_to_target_scaled(
@@ -771,16 +772,16 @@ impl GpuBridge for GlDx11Bridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    ) {
+    ) -> bool {
         let output_gl = match &self.pairs[self.front] {
             Some(pair) => pair.output.gl_texture,
-            None => return,
+            None => return false,
         };
 
         // Lock front output for GL access
         if unsafe { !self.lock_gl_texture_front_output() } {
             warn!("Failed to lock front output GL texture for blit");
-            return;
+            return false;
         }
 
         unsafe {
@@ -815,6 +816,7 @@ impl GpuBridge for GlDx11Bridge {
 
             self.unlock_gl_texture_front_output();
         }
+        true
     }
 
     fn has_result_ready(&self, current_frame: u64) -> bool {
@@ -841,6 +843,12 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn mark_dispatch(&mut self, frame: u64) {
+        // Signal the GPU event query so poll_gpu_query can detect completion.
+        // In the original ntsc-ffgl-plugin this was the caller's responsibility,
+        // but since we now own the context + query it belongs here.
+        unsafe {
+            self.context.End(&self.gpu_query);
+        }
         self.pending_dispatch = true;
         self.last_dispatch_frame = Some(frame);
         self.last_dispatch_time = Some(Instant::now());

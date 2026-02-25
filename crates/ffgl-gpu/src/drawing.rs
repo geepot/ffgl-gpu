@@ -465,7 +465,11 @@ mod dx11_draw {
             BRIDGE.with(|bridge_cell| {
                 let mut bridge = bridge_cell.borrow_mut();
                 if bridge.is_none() {
-                    *bridge = GlDx11Bridge::new(ctx.device.device());
+                    *bridge = GlDx11Bridge::new(
+                        ctx.device.device(),
+                        ctx.device.context(),
+                        ctx.device.query(),
+                    );
                 }
                 bridge.is_some()
             })

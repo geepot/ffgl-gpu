@@ -243,17 +243,14 @@ impl GlMetalBridge {
 
     /// Store the command buffer from a Metal dispatch for later waiting.
     ///
-    /// This is Metal-specific (not part of [`GpuBridge`]).  It records both
-    /// the command buffer reference **and** the frame counter / timestamp so
-    /// that [`GpuBridge::has_result_ready`] can detect gaps.
+    /// This is Metal-specific (not part of [`GpuBridge`]).  Frame counter and
+    /// timestamp are set by the subsequent [`GpuBridge::mark_dispatch`] call
+    /// in the drawing loop — this method only stores the command buffer.
     pub fn store_command_buffer(
         &mut self,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        frame: u64,
     ) {
         self.pending_command_buffer = Some(command_buffer);
-        self.last_dispatch_frame = Some(frame);
-        self.last_dispatch_time = Some(Instant::now());
     }
 
     /// Get the Metal texture for the front input (read by compute shaders).
@@ -448,11 +445,11 @@ impl GpuBridge for GlMetalBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    ) {
+    ) -> bool {
         let back = 1 - self.front;
         let output_gl = match &self.pairs[back] {
             Some(pair) => pair.output.gl_texture,
-            None => return,
+            None => return false,
         };
 
         unsafe {
@@ -485,6 +482,7 @@ impl GpuBridge for GlMetalBridge {
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         }
+        true
     }
 
     fn blit_output_to_target_scaled(
@@ -495,10 +493,10 @@ impl GpuBridge for GlMetalBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    ) {
+    ) -> bool {
         let output_gl = match &self.pairs[self.front] {
             Some(pair) => pair.output.gl_texture,
-            None => return,
+            None => return false,
         };
 
         unsafe {
@@ -531,6 +529,7 @@ impl GpuBridge for GlMetalBridge {
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         }
+        true
     }
 
     fn has_result_ready(&self, current_frame: u64) -> bool {

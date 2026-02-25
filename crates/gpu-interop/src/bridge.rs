@@ -35,6 +35,8 @@ pub trait GpuBridge {
     ) -> bool;
 
     /// Copy the back output texture (previous frame result) to the host FBO.
+    ///
+    /// Returns `false` if setup failed.
     fn blit_back_output_to_target_scaled(
         &mut self,
         host_fbo: GLuint,
@@ -43,9 +45,11 @@ pub trait GpuBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    );
+    ) -> bool;
 
     /// Copy the front output texture (current frame, sync path) to the host FBO.
+    ///
+    /// Returns `false` if setup failed.
     fn blit_output_to_target_scaled(
         &mut self,
         host_fbo: GLuint,
@@ -54,7 +58,7 @@ pub trait GpuBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
-    );
+    ) -> bool;
 
     /// Check if a previous frame's result is ready for presentation.
     fn has_result_ready(&self, current_frame: u64) -> bool;

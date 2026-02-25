@@ -35,7 +35,7 @@ impl GpuPlugin for GpuState {
         bridge: &mut dyn gpu_interop::GpuBridge,
         _data: &FFGLData,
         _input: &GLInput<'_>,
-        frame: u64,
+        _frame: u64,
     ) {
         #[cfg(target_os = "macos")]
         {
@@ -65,7 +65,7 @@ impl GpuPlugin for GpuState {
                 Err(_) => return,
             };
 
-            metal_bridge.store_command_buffer(pending.into_command_buffer(), frame);
+            metal_bridge.store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
