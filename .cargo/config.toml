@@ -1,0 +1,17 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+
+[target.x86_64-pc-windows-msvc]
+# MSVC toolchain (recommended for Windows builds)
+# Requires Visual Studio Build Tools or similar
+
+[build]
+# Default to release builds for better performance
+# target = "x86_64-apple-darwin"  # Uncomment to set default target
+
+[env]
+# Environment variables for cross-compilation
+PKG_CONFIG_ALLOW_CROSS = "1"
+# NOTE: LIBCLANG_PATH is set in build.sh per-platform (not here, because
+# Cargo's [env] section doesn't support platform conditionals).
