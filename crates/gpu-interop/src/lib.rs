@@ -1,1 +1,23 @@
 //! GL to Metal and GL to DX11 texture bridging.
+//!
+//! This crate defines the [`GpuBridge`] trait, a common interface for
+//! transferring OpenGL textures to platform-specific GPU APIs (Metal on macOS,
+//! Direct3D 11 on Windows) and back.
+
+pub mod bridge;
+pub use bridge::GpuBridge;
+
+// Platform-specific implementations.
+// These modules will be populated in subsequent tasks.
+
+#[cfg(target_os = "macos")]
+pub mod metal {
+    //! Metal bridge implementation (macOS via IOSurface).
+    //! To be implemented in Task 7.
+}
+
+#[cfg(target_os = "windows")]
+pub mod dx11 {
+    //! DX11 bridge implementation (Windows via WGL_NV_DX_interop2).
+    //! To be implemented in Task 8.
+}
