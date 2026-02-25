@@ -14,7 +14,4 @@ pub use bridge::GpuBridge;
 pub mod metal;
 
 #[cfg(target_os = "windows")]
-pub mod dx11 {
-    //! DX11 bridge implementation (Windows via WGL_NV_DX_interop2).
-    //! To be implemented in Task 8.
-}
+pub mod dx11;
