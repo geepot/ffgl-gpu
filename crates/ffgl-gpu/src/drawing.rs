@@ -545,14 +545,9 @@ mod dx11_draw {
 
                 // If previous result is ready, swap and blit back output
                 if has_prev {
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        bridge.swap();
-                    }
-
-                    let bridge_opt = bridge_cell.borrow();
-                    let bridge = bridge_opt.as_ref().unwrap();
+                    let mut bridge_opt = bridge_cell.borrow_mut();
+                    let bridge = bridge_opt.as_mut().unwrap();
+                    bridge.swap();
                     bridge.blit_back_output_to_target_scaled(
                         host_fbo,
                         proc_width,

@@ -882,6 +882,9 @@ impl GpuBridge for GlDx11Bridge {
 
 impl Drop for GlDx11Bridge {
     fn drop(&mut self) {
+        // Wait for any in-flight GPU work before destroying shared textures.
+        self.poll_gpu_query();
+        self.pending_dispatch = false;
         self.destroy_pairs();
         unsafe {
             if self.read_fbo != 0 {
