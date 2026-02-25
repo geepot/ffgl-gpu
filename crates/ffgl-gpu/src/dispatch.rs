@@ -446,7 +446,19 @@ mod metal_impl {
 #[cfg(target_os = "windows")]
 mod dx11_impl {
     use super::*;
+    use windows::core::PCSTR;
+    use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_BUFFER;
     use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// Fullscreen quad vertex data: 4 vertices, each with (x, y, u, v).
+    /// Triangle-strip order: bottom-left, bottom-right, top-left, top-right.
+    const FULLSCREEN_QUAD: [[f32; 4]; 4] = [
+        [-1.0, -1.0, 0.0, 1.0], // bottom-left  (pos.xy, uv)
+        [1.0, -1.0, 1.0, 1.0],  // bottom-right
+        [-1.0, 1.0, 0.0, 0.0],  // top-left
+        [1.0, 1.0, 1.0, 0.0],   // top-right
+    ];
 
     impl GpuContext {
         /// Create a compute pipeline from pre-compiled HLSL bytecode (`.cso`).
@@ -466,6 +478,114 @@ mod dx11_impl {
                 shader.ok_or_else(|| anyhow::anyhow!("D3D11 CreateComputeShader returned null"))?;
 
             Ok(ComputePipeline { shader })
+        }
+
+        /// Create a render pipeline from pre-compiled HLSL vertex and pixel
+        /// shader bytecode (`.cso`).
+        ///
+        /// Sets up a fullscreen quad vertex buffer with `POSITION float2 +
+        /// TEXCOORD float2` layout and a linear/clamp sampler for pixel shader
+        /// texture sampling.
+        pub fn create_render_pipeline_from_bytecode(
+            &self,
+            vs_bytecode: &[u8],
+            ps_bytecode: &[u8],
+        ) -> Result<RenderPipeline> {
+            let device = self.device.device();
+
+            // Create vertex shader
+            let mut vs = None;
+            unsafe { device.CreateVertexShader(vs_bytecode, None, Some(&mut vs as *mut _)) }
+                .map_err(|e| anyhow::anyhow!("Failed to create D3D11 vertex shader: {e}"))?;
+            let vs = vs.ok_or_else(|| anyhow::anyhow!("D3D11 CreateVertexShader returned null"))?;
+
+            // Create pixel shader
+            let mut ps = None;
+            unsafe { device.CreatePixelShader(ps_bytecode, None, Some(&mut ps as *mut _)) }
+                .map_err(|e| anyhow::anyhow!("Failed to create D3D11 pixel shader: {e}"))?;
+            let ps = ps.ok_or_else(|| anyhow::anyhow!("D3D11 CreatePixelShader returned null"))?;
+
+            // Create input layout: POSITION float2 + TEXCOORD float2
+            let input_elements = [
+                D3D11_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(b"POSITION\0".as_ptr()),
+                    SemanticIndex: 0,
+                    Format: DXGI_FORMAT_R32G32_FLOAT,
+                    InputSlot: 0,
+                    AlignedByteOffset: 0,
+                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                    InstanceDataStepRate: 0,
+                },
+                D3D11_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(b"TEXCOORD\0".as_ptr()),
+                    SemanticIndex: 0,
+                    Format: DXGI_FORMAT_R32G32_FLOAT,
+                    InputSlot: 0,
+                    AlignedByteOffset: 8,
+                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                    InstanceDataStepRate: 0,
+                },
+            ];
+
+            let mut input_layout = None;
+            unsafe {
+                device.CreateInputLayout(
+                    &input_elements,
+                    vs_bytecode,
+                    Some(&mut input_layout as *mut _),
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 input layout: {e}"))?;
+            let input_layout = input_layout
+                .ok_or_else(|| anyhow::anyhow!("D3D11 CreateInputLayout returned null"))?;
+
+            // Create fullscreen quad vertex buffer
+            let quad_data = FULLSCREEN_QUAD;
+            let vb_desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of_val(&quad_data) as u32,
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            let vb_init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: quad_data.as_ptr() as *const _,
+                ..Default::default()
+            };
+            let mut quad_vb = None;
+            unsafe {
+                device.CreateBuffer(&vb_desc, Some(&vb_init), Some(&mut quad_vb as *mut _))
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to create fullscreen quad VB: {e}"))?;
+            let quad_vb =
+                quad_vb.ok_or_else(|| anyhow::anyhow!("D3D11 CreateBuffer(VB) returned null"))?;
+
+            // Create linear/clamp sampler
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            unsafe {
+                device.CreateSamplerState(&sampler_desc, Some(&mut sampler as *mut _))
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 sampler: {e}"))?;
+            let sampler =
+                sampler.ok_or_else(|| anyhow::anyhow!("D3D11 CreateSamplerState returned null"))?;
+
+            Ok(RenderPipeline {
+                vs,
+                ps,
+                input_layout,
+                quad_vb,
+                sampler,
+            })
         }
 
         /// Create a GPU buffer as a structured buffer with UAV + SRV views.
@@ -499,7 +619,7 @@ mod dx11_impl {
 
             // Create UAV
             let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
-                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                Format: DXGI_FORMAT_UNKNOWN,
                 ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
                 Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
                     Buffer: D3D11_BUFFER_UAV {
@@ -523,7 +643,7 @@ mod dx11_impl {
 
             // Create SRV
             let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                Format: DXGI_FORMAT_UNKNOWN,
                 ViewDimension: D3D_SRV_DIMENSION_BUFFER,
                 Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D11_BUFFER_SRV {
@@ -559,7 +679,9 @@ mod dx11_impl {
         /// Dispatch a compute shader on the immediate context.
         ///
         /// Binds the compute shader, UAVs, SRVs, and constant buffers, then
-        /// dispatches the given number of thread groups.
+        /// dispatches the given number of thread groups. Unbinds all CS
+        /// resources after dispatch to prevent resource hazards in multi-pass
+        /// scenarios.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
@@ -581,13 +703,117 @@ mod dx11_impl {
                     ctx.CSSetConstantBuffers(0, cbufs);
                 }
                 ctx.Dispatch(thread_groups.0, thread_groups.1, thread_groups.2);
+
+                // Unbind all CS resources to prevent hazards when the same
+                // texture is used as SRV in a subsequent pass.
+                let null_uavs: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
+                let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
+                let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
+                ctx.CSSetUnorderedAccessViews(0, &null_uavs, None);
+                ctx.CSSetShaderResources(0, &null_srvs);
+                ctx.CSSetConstantBuffers(0, &null_cbufs);
             }
         }
 
-        /// Signal the GPU event query for synchronization.
-        pub fn signal_gpu_query(&self) {
+        /// Dispatch a fullscreen render pass using the given render pipeline.
+        ///
+        /// Creates a temporary render target view from `output_texture`, sets
+        /// up the viewport, draws a fullscreen quad, and unbinds all resources
+        /// afterward to prevent hazards.
+        pub fn dispatch_render(
+            &self,
+            pipeline: &RenderPipeline,
+            output_texture: &ID3D11Texture2D,
+            pixel_srvs: &[Option<ID3D11ShaderResourceView>],
+            pixel_cbufs: &[Option<ID3D11Buffer>],
+        ) -> Result<()> {
+            let device = self.device.device();
+            let ctx = self.device.context();
+
+            // Query texture dimensions for viewport
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { output_texture.GetDesc(&mut desc) };
+
+            // Create temporary RTV
+            let mut rtv = None;
             unsafe {
-                self.device.context().End(self.device.query());
+                device.CreateRenderTargetView(output_texture, None, Some(&mut rtv as *mut _))
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to create RTV for render dispatch: {e}"))?;
+            let rtv = rtv.ok_or_else(|| anyhow::anyhow!("D3D11 CreateRTV returned null"))?;
+
+            unsafe {
+                // Set viewport
+                let viewport = D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: desc.Width as f32,
+                    Height: desc.Height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                };
+                ctx.RSSetViewports(Some(&[viewport]));
+
+                // Input assembler
+                ctx.IASetInputLayout(&pipeline.input_layout);
+                let stride = std::mem::size_of::<[f32; 4]>() as u32;
+                let offset = 0u32;
+                ctx.IASetVertexBuffers(
+                    0,
+                    1,
+                    Some(&Some(pipeline.quad_vb.clone())),
+                    Some(&stride),
+                    Some(&offset),
+                );
+                ctx.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                );
+
+                // Vertex shader
+                ctx.VSSetShader(&pipeline.vs, None);
+
+                // Pixel shader
+                ctx.PSSetShader(&pipeline.ps, None);
+                if !pixel_srvs.is_empty() {
+                    ctx.PSSetShaderResources(0, pixel_srvs);
+                }
+                if !pixel_cbufs.is_empty() {
+                    ctx.PSSetConstantBuffers(0, pixel_cbufs);
+                }
+                ctx.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
+
+                // Output merger
+                ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+
+                // Draw fullscreen quad
+                ctx.Draw(4, 0);
+
+                // Unbind render target and PS SRVs to prevent resource hazards
+                let null_rtvs: [Option<ID3D11RenderTargetView>; 1] = Default::default();
+                ctx.OMSetRenderTargets(Some(&null_rtvs), None);
+                let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
+                ctx.PSSetShaderResources(0, &null_srvs);
+                let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
+                ctx.PSSetConstantBuffers(0, &null_cbufs);
+            }
+
+            Ok(())
+        }
+
+        /// Map a dynamic constant buffer, copy data into it, and unmap.
+        ///
+        /// The buffer must have been created with `D3D11_USAGE_DYNAMIC` and
+        /// `D3D11_CPU_ACCESS_WRITE` (e.g. via
+        /// [`create_dynamic_cbuf`](gpu_interop::dx11::create_dynamic_cbuf)).
+        pub fn update_constant_buffer(&self, buffer: &ID3D11Buffer, data: &[u8]) {
+            let ctx = self.device.context();
+            unsafe {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                let hr = ctx.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped));
+                if hr.is_ok() {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.pData as *mut u8, data.len());
+                    ctx.Unmap(buffer, 0);
+                }
             }
         }
     }

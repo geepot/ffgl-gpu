@@ -159,6 +159,14 @@ pub struct HlslEntry {
 pub fn compile_hlsl_shaders(shader_dir: &Path, entries: &[HlslEntry]) {
     use std::process::Command;
 
+    if !shader_dir.is_dir() {
+        println!(
+            "cargo:warning=No HLSL shader directory found at {shader_dir:?}, \
+             skipping shader compilation"
+        );
+        return;
+    }
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     let fxc =

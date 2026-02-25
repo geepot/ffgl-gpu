@@ -1,0 +1,21 @@
+[package]
+name = "ffgl-blur-dx11"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ffgl-core = { path = "../../../crates/ffgl-core" }
+ffgl-glium = { path = "../../../crates/ffgl-glium" }
+ffgl-gpu = { path = "../../../crates/ffgl-gpu" }
+gpu-interop = { path = "../../../crates/gpu-interop" }
+gl = "0.14.0"
+anyhow = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+
+[build-dependencies]
+ffgl-gpu = { path = "../../../crates/ffgl-gpu" }

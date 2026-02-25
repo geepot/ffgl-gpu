@@ -43,4 +43,6 @@ pub struct RenderPipeline {
     pub(crate) input_layout: windows::Win32::Graphics::Direct3D11::ID3D11InputLayout,
     #[cfg(target_os = "windows")]
     pub(crate) quad_vb: windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
+    #[cfg(target_os = "windows")]
+    pub(crate) sampler: windows::Win32::Graphics::Direct3D11::ID3D11SamplerState,
 }

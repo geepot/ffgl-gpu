@@ -589,3 +589,23 @@ impl GpuBridge for GlMetalBridge {
         self.dimensions
     }
 }
+
+impl Drop for GlMetalBridge {
+    fn drop(&mut self) {
+        // Wait for any in-flight GPU work before destroying shared textures.
+        if let Some(cb) = self.pending_command_buffer.take() {
+            cb.waitUntilCompleted();
+        }
+        // Drop pairs (releases IOSurfaces and GL textures via SharedTexture::drop).
+        self.pairs = [None, None];
+        // Delete GL FBOs to prevent leaks.
+        unsafe {
+            if self.read_fbo != 0 {
+                gl::DeleteFramebuffers(1, &self.read_fbo);
+            }
+            if self.draw_fbo != 0 {
+                gl::DeleteFramebuffers(1, &self.draw_fbo);
+            }
+        }
+    }
+}

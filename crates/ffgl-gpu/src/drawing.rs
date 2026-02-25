@@ -411,7 +411,22 @@ mod dx11_draw {
 
     pub fn validate_gl_state() -> bool {
         clear_gl_errors();
-        is_context_current()
+        if !is_context_current() {
+            return false;
+        }
+        let mut need_release = false;
+        BRIDGE.with(|cell| {
+            if let Some(bridge) = cell.borrow().as_ref() {
+                if !bridge.is_valid() {
+                    need_release = true;
+                }
+            }
+        });
+        if need_release {
+            release_resources();
+            LAST_INSTANCE_ID.with(|cell| *cell.borrow_mut() = None);
+        }
+        true
     }
 
     pub fn draw<P: GpuPlugin>(

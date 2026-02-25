@@ -121,6 +121,7 @@ impl SharedTexture {
         interop_device: *mut GLvoid,
         width: u32,
         height: u32,
+        extra_bind_flags: u32,
     ) -> Option<Self> {
         // Create D3D11 texture with SHARED flag for WGL interop
         let desc = D3D11_TEXTURE2D_DESC {
@@ -134,7 +135,8 @@ impl SharedTexture {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_UNORDERED_ACCESS.0) as u32,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_UNORDERED_ACCESS.0) as u32
+                | extra_bind_flags,
             CPUAccessFlags: 0,
             MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
         };
@@ -203,8 +205,16 @@ impl SharedTexturePair {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        let input = SharedTexture::new(device, wgl_fns, interop_device, width, height)?;
-        let output = SharedTexture::new(device, wgl_fns, interop_device, width, height)?;
+        let input = SharedTexture::new(device, wgl_fns, interop_device, width, height, 0)?;
+        // Output texture also needs RENDER_TARGET so render pipelines can draw to it.
+        let output = SharedTexture::new(
+            device,
+            wgl_fns,
+            interop_device,
+            width,
+            height,
+            D3D11_BIND_RENDER_TARGET.0 as u32,
+        )?;
 
         // Create and cache the SRV for the input texture
         let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
@@ -393,6 +403,12 @@ impl GlDx11Bridge {
         Some(self.pairs[self.front].as_ref()?.output_uav.clone())
     }
 
+    /// Get the D3D11 output texture for the front pair (for render pipeline targets).
+    /// Returns a cloned COM reference (cheap AddRef, no device allocation).
+    pub fn output_texture(&self) -> Option<ID3D11Texture2D> {
+        Some(self.pairs[self.front].as_ref()?.output.d3d_texture.clone())
+    }
+
     /// Get the D3D11 SRV for the back output texture (previous frame's result).
     /// Used by interleaved field modes to fill non-field rows.
     pub fn back_output_srv(&self) -> Option<ID3D11ShaderResourceView> {
@@ -413,6 +429,14 @@ impl GlDx11Bridge {
     /// Borrow the GPU event query held by this bridge.
     pub fn query(&self) -> &ID3D11Query {
         &self.gpu_query
+    }
+
+    /// Check whether the bridge FBO handles are still valid.
+    pub fn is_valid(&self) -> bool {
+        if self.read_fbo == 0 && self.draw_fbo == 0 {
+            return self.dimensions == (0, 0); // not yet initialised is valid
+        }
+        unsafe { gl::IsFramebuffer(self.read_fbo) != 0 && gl::IsFramebuffer(self.draw_fbo) != 0 }
     }
 
     // -- Lock / unlock helpers ------------------------------------------------

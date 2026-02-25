@@ -7,10 +7,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-ffgl-core = { path = "../../crates/ffgl-core" }
-ffgl-glium = { path = "../../crates/ffgl-glium" }
-ffgl-gpu = { path = "../../crates/ffgl-gpu" }
-gpu-interop = { path = "../../crates/gpu-interop" }
+ffgl-core = { path = "../../../crates/ffgl-core" }
+ffgl-glium = { path = "../../../crates/ffgl-glium" }
+ffgl-gpu = { path = "../../../crates/ffgl-gpu" }
+gpu-interop = { path = "../../../crates/gpu-interop" }
 gl = "0.14.0"
 anyhow = "1"
 
@@ -19,4 +19,4 @@ objc2 = { workspace = true }
 objc2-metal = { workspace = true }
 
 [build-dependencies]
-ffgl-gpu = { path = "../../crates/ffgl-gpu" }
+ffgl-gpu = { path = "../../../crates/ffgl-gpu" }

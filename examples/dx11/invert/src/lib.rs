@@ -1,0 +1,144 @@
+#![allow(dead_code)]
+//! DX11 Invert FFGL plugin example.
+//!
+//! Demonstrates a DX11 render pipeline (vertex + pixel shader) that inverts the
+//! colors of the input image using a fullscreen quad pass.
+
+use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
+use ffgl_core::info::{PluginInfo, PluginType};
+use ffgl_core::{FFGLData, GLInput};
+use ffgl_glium::FFGLGlium;
+use ffgl_gpu::pipeline::RenderPipeline;
+use ffgl_gpu::plugin::GpuPlugin;
+use ffgl_gpu::{GpuContext, draw_gpu_effect};
+
+/// Compiled HLSL vertex shader bytecode, embedded at build time.
+#[cfg(target_os = "windows")]
+const VS_SHADER: &[u8] = ffgl_gpu::include_hlsl_shader!("vs_main");
+#[cfg(target_os = "windows")]
+const PS_SHADER: &[u8] = ffgl_gpu::include_hlsl_shader!("ps_main");
+
+#[cfg(not(target_os = "windows"))]
+const VS_SHADER: &[u8] = &[];
+#[cfg(not(target_os = "windows"))]
+const PS_SHADER: &[u8] = &[];
+
+/// No Metal shaders for this DX11-only plugin.
+const METALLIB_BYTES: &[u8] = &[];
+
+/// Inner GPU state, separate from the glium context to avoid double-borrow.
+struct GpuState {
+    pipeline: Option<RenderPipeline>,
+}
+
+impl GpuPlugin for GpuState {
+    fn gpu_init(&mut self, ctx: &GpuContext) -> anyhow::Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            self.pipeline =
+                Some(ctx.create_render_pipeline_from_bytecode(VS_SHADER, PS_SHADER)?);
+        }
+        let _ = ctx;
+        Ok(())
+    }
+
+    fn gpu_draw(
+        &mut self,
+        ctx: &GpuContext,
+        bridge: &mut dyn gpu_interop::GpuBridge,
+        _data: &FFGLData,
+        _input: &GLInput<'_>,
+        _frame: u64,
+    ) {
+        #[cfg(target_os = "windows")]
+        {
+            use gpu_interop::dx11::GlDx11Bridge;
+
+            let pipeline = match &self.pipeline {
+                Some(p) => p,
+                None => return,
+            };
+
+            let dx_bridge = match bridge.as_any_mut().downcast_mut::<GlDx11Bridge>() {
+                Some(b) => b,
+                None => return,
+            };
+
+            let input_srv = match dx_bridge.input_srv() {
+                Some(srv) => srv,
+                None => return,
+            };
+
+            let output_texture = match dx_bridge.output_texture() {
+                Some(tex) => tex,
+                None => return,
+            };
+
+            let _ = ctx.dispatch_render(pipeline, output_texture, &[Some(input_srv)], &[]);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (ctx, bridge);
+        }
+    }
+}
+
+// SAFETY: FFGL plugins are called single-threaded from the host.
+unsafe impl Send for GpuState {}
+unsafe impl Sync for GpuState {}
+
+pub struct DxInvert {
+    glium: FFGLGlium,
+    gpu: GpuState,
+    frame_counter: u64,
+    instance_id: u64,
+}
+
+// SAFETY: FFGL plugins are called single-threaded from the host.
+unsafe impl Send for DxInvert {}
+unsafe impl Sync for DxInvert {}
+
+impl SimpleFFGLInstance for DxInvert {
+    fn new(inst_data: &FFGLData) -> Self {
+        let s = Self {
+            glium: FFGLGlium::new(inst_data),
+            gpu: GpuState { pipeline: None },
+            frame_counter: 0,
+            instance_id: 0,
+        };
+        let id = &s as *const _ as u64;
+        Self {
+            instance_id: id,
+            ..s
+        }
+    }
+
+    fn plugin_info() -> PluginInfo {
+        PluginInfo {
+            unique_id: *b"DInv",
+            name: *b"DX Invert\0\0\0\0\0\0\0",
+            ty: PluginType::Effect,
+            about: "DX11 color inversion via render pipeline".to_string(),
+            description: "Inverts colors using a DX11 vertex/pixel shader pair".to_string(),
+        }
+    }
+
+    fn draw(&mut self, data: &FFGLData, frame_data: GLInput) {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let id = self.instance_id;
+        draw_gpu_effect(
+            &mut self.gpu,
+            id,
+            &mut self.glium,
+            data,
+            frame_data,
+            self.frame_counter,
+            1.0,
+            1.0,
+            METALLIB_BYTES,
+        );
+    }
+}
+
+ffgl_core::plugin_main!(SimpleFFGLHandler<DxInvert>);
