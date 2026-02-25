@@ -1,0 +1,51 @@
+//! Utilities for creating common glium texture types.
+
+use glium::{
+    backend::Facade,
+    texture::{DepthTexture2d, SrgbTexture2d},
+    Texture2d,
+};
+
+const NO_MIPMAP: glium::texture::MipmapsOption = glium::texture::MipmapsOption::NoMipmap;
+
+/// Create an empty RGBA8 2D texture.
+pub fn new_texture_2d(
+    facade: &impl Facade,
+    (width, height): (u32, u32),
+) -> Result<Texture2d, glium::texture::TextureCreationError> {
+    Texture2d::empty_with_format(
+        facade,
+        glium::texture::UncompressedFloatFormat::U8U8U8U8,
+        NO_MIPMAP,
+        width,
+        height,
+    )
+}
+
+/// Create an empty 16-bit depth texture.
+pub fn new_depth_texture_2d(
+    facade: &impl Facade,
+    (width, height): (u32, u32),
+) -> Result<DepthTexture2d, glium::texture::TextureCreationError> {
+    DepthTexture2d::empty_with_format(
+        facade,
+        glium::texture::DepthFormat::I16,
+        NO_MIPMAP,
+        width,
+        height,
+    )
+}
+
+/// Create an empty sRGB RGBA8 2D texture.
+pub fn new_texture_srgb_2d(
+    facade: &impl Facade,
+    (width, height): (u32, u32),
+) -> Result<SrgbTexture2d, glium::texture::TextureCreationError> {
+    SrgbTexture2d::empty_with_format(
+        facade,
+        glium::texture::SrgbFormat::U8U8U8U8,
+        NO_MIPMAP,
+        width,
+        height,
+    )
+}

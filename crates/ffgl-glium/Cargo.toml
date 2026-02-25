@@ -8,3 +8,4 @@ ffgl-core = { workspace = true }
 glium = { workspace = true }
 gl = { workspace = true }
 gl_loader = { workspace = true }
+tracing = { workspace = true }
