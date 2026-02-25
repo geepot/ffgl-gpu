@@ -1,0 +1,10 @@
+[package]
+name = "ffgl-glium"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ffgl-core = { workspace = true }
+glium = { workspace = true }
+gl = { workspace = true }
+gl_loader = { workspace = true }

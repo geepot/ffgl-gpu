@@ -1,0 +1,21 @@
+[package]
+name = "gpu-interop"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gl = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-io-surface = { workspace = true }
+objc2-open-gl = { workspace = true }
+objc2-core-foundation = { workspace = true }
+dispatch2 = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }

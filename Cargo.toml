@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/ffgl-core",
+    "crates/ffgl-glium",
+    "crates/gpu-interop",
+    "crates/ffgl-gpu",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+ffgl-core = { path = "crates/ffgl-core" }
+ffgl-glium = { path = "crates/ffgl-glium" }
+gpu-interop = { path = "crates/gpu-interop" }
+ffgl-gpu = { path = "crates/ffgl-gpu" }
+
+# OpenGL
+gl = "0.14.0"
+glium = "0.36.0"
+gl_loader = "0.1.2"
+
+# Utilities
+tracing = "0.1"
+anyhow = "1"
+once_cell = "1"
+num = "0.4"
+num-derive = "0.4"
+num-traits = "0.2"
+
+# macOS Metal
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLTexture", "MTLBuffer", "MTLResource", "MTLRenderPipeline", "MTLRenderCommandEncoder", "MTLRenderPass"] }
+objc2-io-surface = "0.3"
+objc2-open-gl = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
+
+# Windows DX11
+[workspace.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+]
