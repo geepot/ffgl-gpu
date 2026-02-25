@@ -3,10 +3,14 @@
 //! Demonstrates the simplest possible GPU compute plugin: a single compute
 //! kernel that copies the input texture to the output texture pixel-for-pixel.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
@@ -80,7 +84,7 @@ impl GpuPlugin for GpuState {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge, frame);
+            let _ = (ctx, bridge);
         }
     }
 }
@@ -102,17 +106,11 @@ unsafe impl Sync for Passthrough {}
 
 impl SimpleFFGLInstance for Passthrough {
     fn new(inst_data: &FFGLData) -> Self {
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState { pipeline: None },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        // Use the struct address as a stable instance id.
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 

@@ -14,11 +14,15 @@ pub struct GLInput<'a> {
 impl<'a> From<&'a ProcessOpenGLStruct> for GLInput<'a> {
     fn from(val: &'a ProcessOpenGLStruct) -> GLInput<'a> {
         GLInput {
-            textures: unsafe {
-                std::slice::from_raw_parts(
-                    *val.inputTextures as *const _,
-                    val.numInputTextures as usize,
-                )
+            textures: if val.numInputTextures == 0 || val.inputTextures.is_null() {
+                &[]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        *val.inputTextures as *const _,
+                        val.numInputTextures as usize,
+                    )
+                }
             },
             host: val.HostFBO,
         }

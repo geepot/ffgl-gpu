@@ -811,6 +811,12 @@ mod dx11_impl {
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 let hr = ctx.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped));
                 if hr.is_ok() {
+                    debug_assert!(
+                        data.len() <= mapped.RowPitch as usize,
+                        "update_constant_buffer: data ({} bytes) exceeds mapped region ({} bytes)",
+                        data.len(),
+                        mapped.RowPitch,
+                    );
                     std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.pData as *mut u8, data.len());
                     ctx.Unmap(buffer, 0);
                 }

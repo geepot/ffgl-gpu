@@ -8,6 +8,7 @@
 
 use std::ffi::CString;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
@@ -17,6 +18,8 @@ use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "windows")]
 use gpu_interop::dx11::GlDx11Bridge;
@@ -162,10 +165,12 @@ impl GpuState {
             return;
         }
 
-        self.intermediate_texture = Some(texture);
-        self.intermediate_srv = srv;
-        self.intermediate_uav = uav;
-        self.intermediate_dims = (width, height);
+        if srv.is_some() && uav.is_some() {
+            self.intermediate_texture = Some(texture);
+            self.intermediate_srv = srv;
+            self.intermediate_uav = uav;
+            self.intermediate_dims = (width, height);
+        }
     }
 
     /// Map the dynamic constant buffer, write data, and unmap.
@@ -284,6 +289,9 @@ impl GpuPlugin for GpuState {
             let groups_y = (h + 15) / 16;
 
             // Pass 1: horizontal blur (input -> intermediate)
+            // dispatch_compute unbinds all CS resources after each dispatch,
+            // so the intermediate UAV is safely unbound before pass 2 binds
+            // it as an SRV.
             ctx.dispatch_compute(
                 h_pipeline,
                 &[Some(intermediate_uav)],
@@ -291,16 +299,6 @@ impl GpuPlugin for GpuState {
                 &[Some(cbuf_ref.clone())],
                 (groups_x, groups_y, 1),
             );
-
-            // Unbind the intermediate UAV before binding it as SRV for the
-            // next pass. D3D11 requires that a resource is not simultaneously
-            // bound as both SRV and UAV.
-            unsafe {
-                let null_uav: [Option<ID3D11UnorderedAccessView>; 1] = [None];
-                let null_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
-                dx11_context.CSSetUnorderedAccessViews(0, &null_uav, None);
-                dx11_context.CSSetShaderResources(0, &null_srv);
-            }
 
             // Pass 2: vertical blur (intermediate -> output)
             ctx.dispatch_compute(
@@ -310,14 +308,6 @@ impl GpuPlugin for GpuState {
                 &[Some(cbuf_ref)],
                 (groups_x, groups_y, 1),
             );
-
-            // Unbind resources after dispatch.
-            unsafe {
-                let null_uav: [Option<ID3D11UnorderedAccessView>; 1] = [None];
-                let null_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
-                dx11_context.CSSetUnorderedAccessViews(0, &null_uav, None);
-                dx11_context.CSSetShaderResources(0, &null_srv);
-            }
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -327,7 +317,10 @@ impl GpuPlugin for GpuState {
     }
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: GpuState contains DX11 COM pointers created with
+// D3D11_CREATE_DEVICE_SINGLETHREADED, which omits internal locking. This is
+// sound because the FFGL host guarantees single-threaded access per plugin
+// instance — no concurrent &self or &mut self calls ever occur.
 unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
@@ -338,14 +331,14 @@ pub struct DxBlur {
     instance_id: u64,
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: See GpuState safety comment above.
 unsafe impl Send for DxBlur {}
 unsafe impl Sync for DxBlur {}
 
 impl SimpleFFGLInstance for DxBlur {
     fn new(inst_data: &FFGLData) -> Self {
         let default_radius = cached_params()[0].default_val();
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 radius_param: default_radius,
@@ -363,12 +356,7 @@ impl SimpleFFGLInstance for DxBlur {
                 cbuf: None,
             },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 

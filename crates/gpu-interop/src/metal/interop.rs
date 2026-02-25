@@ -312,8 +312,9 @@ impl GpuBridge for GlMetalBridge {
         // Dimension change: wait for any in-flight work before destroying textures.
         self.wait_for_previous();
 
-        // Clean up old FBOs.
+        // Clean up old FBOs (unbind first to avoid deleting a bound FBO).
         unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             if self.read_fbo != 0 {
                 gl::DeleteFramebuffers(1, &self.read_fbo);
             }
@@ -549,7 +550,7 @@ impl GpuBridge for GlMetalBridge {
     }
 
     fn wait_for_pending(&mut self) {
-        if let Some(cb) = &self.pending_command_buffer {
+        if let Some(cb) = self.pending_command_buffer.take() {
             cb.waitUntilCompleted();
         }
     }
@@ -572,6 +573,7 @@ impl GpuBridge for GlMetalBridge {
         self.last_dispatch_frame = None;
         self.last_dispatch_time = None;
         unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             if self.read_fbo != 0 {
                 gl::DeleteFramebuffers(1, &self.read_fbo);
                 self.read_fbo = 0;
@@ -598,8 +600,9 @@ impl Drop for GlMetalBridge {
         }
         // Drop pairs (releases IOSurfaces and GL textures via SharedTexture::drop).
         self.pairs = [None, None];
-        // Delete GL FBOs to prevent leaks.
+        // Unbind before deleting to avoid GL errors on some drivers.
         unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             if self.read_fbo != 0 {
                 gl::DeleteFramebuffers(1, &self.read_fbo);
             }

@@ -18,6 +18,7 @@
 
 use std::ffi::CString;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
@@ -27,6 +28,8 @@ use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Compiled Metal shader library, embedded at build time.
 #[cfg(target_os = "macos")]
@@ -262,7 +265,7 @@ impl GpuPlugin for GpuState {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge, frame);
+            let _ = (ctx, bridge);
         }
     }
 }
@@ -286,7 +289,7 @@ impl SimpleFFGLInstance for KitchenSink {
             *p = params_info[i].default_val();
         }
 
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 params,
@@ -301,12 +304,7 @@ impl SimpleFFGLInstance for KitchenSink {
                 intermediate_dims: (0, 0),
             },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 

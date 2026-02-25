@@ -3,10 +3,14 @@
 //! Demonstrates a render pipeline (vertex + fragment shader) that inverts the
 //! colors of the input image using a fullscreen quad pass.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 use ffgl_gpu::pipeline::RenderPipeline;
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
@@ -70,7 +74,7 @@ impl GpuPlugin for GpuState {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge, frame);
+            let _ = (ctx, bridge);
         }
     }
 }
@@ -92,16 +96,11 @@ unsafe impl Sync for Invert {}
 
 impl SimpleFFGLInstance for Invert {
     fn new(inst_data: &FFGLData) -> Self {
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState { pipeline: None },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 

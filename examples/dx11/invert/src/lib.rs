@@ -4,6 +4,8 @@
 //! Demonstrates a DX11 render pipeline (vertex + pixel shader) that inverts the
 //! colors of the input image using a fullscreen quad pass.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::{FFGLData, GLInput};
@@ -11,6 +13,8 @@ use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::RenderPipeline;
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Compiled HLSL vertex shader bytecode, embedded at build time.
 #[cfg(target_os = "windows")]
@@ -84,7 +88,10 @@ impl GpuPlugin for GpuState {
     }
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: GpuState contains DX11 COM pointers created with
+// D3D11_CREATE_DEVICE_SINGLETHREADED, which omits internal locking. This is
+// sound because the FFGL host guarantees single-threaded access per plugin
+// instance — no concurrent &self or &mut self calls ever occur.
 unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
@@ -95,22 +102,17 @@ pub struct DxInvert {
     instance_id: u64,
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: See GpuState safety comment above.
 unsafe impl Send for DxInvert {}
 unsafe impl Sync for DxInvert {}
 
 impl SimpleFFGLInstance for DxInvert {
     fn new(inst_data: &FFGLData) -> Self {
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState { pipeline: None },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 

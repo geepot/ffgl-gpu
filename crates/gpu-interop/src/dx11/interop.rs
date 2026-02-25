@@ -115,6 +115,15 @@ struct SharedTexture {
 }
 
 impl SharedTexture {
+    /// Clean up the GL texture manually. Called by `destroy_pairs` which
+    /// handles WGL interop unregistration separately.
+    fn delete_gl_texture(&mut self) {
+        if self.gl_texture != 0 {
+            unsafe { gl::DeleteTextures(1, &self.gl_texture) };
+            self.gl_texture = 0;
+        }
+    }
+
     fn new(
         device: &ID3D11Device,
         wgl_fns: &WglInteropFunctions,
@@ -181,6 +190,19 @@ impl SharedTexture {
             gl_texture,
             interop_handle,
         })
+    }
+}
+
+impl Drop for SharedTexture {
+    fn drop(&mut self) {
+        // Safety net: delete the GL texture if it hasn't been cleaned up by
+        // destroy_pairs(). The interop handle cannot be unregistered here
+        // because we don't have access to the WGL function pointers or the
+        // interop device — that is handled by GlDx11Bridge::destroy_pairs().
+        if self.gl_texture != 0 {
+            unsafe { gl::DeleteTextures(1, &self.gl_texture) };
+            self.gl_texture = 0;
+        }
     }
 }
 
@@ -441,7 +463,32 @@ impl GlDx11Bridge {
 
     // -- Lock / unlock helpers ------------------------------------------------
 
-    /// Lock the front pair's GL textures for GL access.
+    /// Lock the front pair's input GL texture only (for blitting host input).
+    unsafe fn lock_gl_texture_front_input(&self) -> bool {
+        let pair = match &self.pairs[self.front] {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let mut handles = [pair.input.interop_handle];
+        let result = (self.wgl_fns.dx_lock_objects)(self.interop_device, 1, handles.as_mut_ptr());
+        result != 0
+    }
+
+    /// Unlock the front pair's input GL texture only.
+    unsafe fn unlock_gl_texture_front_input(&self) -> bool {
+        let pair = match &self.pairs[self.front] {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let mut handles = [pair.input.interop_handle];
+        let result =
+            (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
+        result != 0
+    }
+
+    /// Lock the front pair's GL textures (both input and output) for GL access.
     /// Must be called before any GL operations on shared textures.
     unsafe fn lock_gl_textures_front(&self) -> bool {
         let pair = match &self.pairs[self.front] {
@@ -458,7 +505,7 @@ impl GlDx11Bridge {
         result != 0
     }
 
-    /// Unlock the front pair's GL textures to release them back to D3D11.
+    /// Unlock the front pair's GL textures (both input and output) to release them back to D3D11.
     unsafe fn unlock_gl_textures_front(&self) -> bool {
         let pair = match &self.pairs[self.front] {
             Some(p) => p,
@@ -564,18 +611,20 @@ impl GlDx11Bridge {
     /// Unregister all shared textures and drop the pairs.
     fn destroy_pairs(&mut self) {
         for pair in &mut self.pairs {
-            if let Some(p) = pair.take() {
+            if let Some(mut p) = pair.take() {
                 unsafe {
                     (self.wgl_fns.dx_unregister_object)(
                         self.interop_device,
                         p.input.interop_handle,
                     );
-                    gl::DeleteTextures(1, &p.input.gl_texture);
+                    p.input.interop_handle = std::ptr::null_mut();
+                    p.input.delete_gl_texture();
                     (self.wgl_fns.dx_unregister_object)(
                         self.interop_device,
                         p.output.interop_handle,
                     );
-                    gl::DeleteTextures(1, &p.output.gl_texture);
+                    p.output.interop_handle = std::ptr::null_mut();
+                    p.output.delete_gl_texture();
                 }
             }
         }
@@ -670,9 +719,9 @@ impl GpuBridge for GlDx11Bridge {
             None => return false,
         };
 
-        // Lock front input for GL access
-        if unsafe { !self.lock_gl_textures_front() } {
-            warn!("Failed to lock GL textures for input blit");
+        // Lock only the front input for GL access (output is not touched here).
+        if unsafe { !self.lock_gl_texture_front_input() } {
+            warn!("Failed to lock GL input texture for input blit");
             return false;
         }
 
@@ -690,7 +739,7 @@ impl GpuBridge for GlDx11Bridge {
             if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
                 warn!("READ_FRAMEBUFFER incomplete for host texture {host_texture}");
                 gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                self.unlock_gl_textures_front();
+                self.unlock_gl_texture_front_input();
                 return false;
             }
             gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
@@ -724,8 +773,8 @@ impl GpuBridge for GlDx11Bridge {
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             gl::Flush();
 
-            // Unlock so D3D11 can access the textures
-            self.unlock_gl_textures_front();
+            // Unlock so D3D11 can access the input texture
+            self.unlock_gl_texture_front_input();
         }
         true
     }
@@ -903,6 +952,22 @@ impl GpuBridge for GlDx11Bridge {
         self.dimensions
     }
 }
+
+// SAFETY: GlDx11Bridge contains a raw `*mut GLvoid` (the WGL interop device
+// handle) which makes it `!Send` and `!Sync` by default. This is safe because:
+//
+// - The bridge is created on the host's GL thread and only used from that same
+//   thread (FFGL hosts call plugins single-threaded per instance).
+// - The `interop_device` handle is an opaque WGL resource tied to the current
+//   GL context; it is never shared across threads.
+// - All D3D11 objects (device, context, query) are COM pointers with their own
+//   reference counting; they are safe to move between threads.
+//
+// `Send` is required so the bridge can be stored in thread-local storage and
+// moved during plugin initialisation. `Sync` is required by `GpuBridge: Any`
+// bounds but is upheld by the single-threaded FFGL calling convention.
+unsafe impl Send for GlDx11Bridge {}
+unsafe impl Sync for GlDx11Bridge {}
 
 impl Drop for GlDx11Bridge {
     fn drop(&mut self) {

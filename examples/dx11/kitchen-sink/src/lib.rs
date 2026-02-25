@@ -19,6 +19,7 @@
 
 use std::ffi::CString;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
@@ -28,6 +29,8 @@ use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
 use ffgl_gpu::{GpuContext, draw_gpu_effect};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Compiled HLSL shader bytecode, embedded at build time
@@ -139,7 +142,10 @@ struct GpuState {
     cbuf: Option<windows::Win32::Graphics::Direct3D11::ID3D11Buffer>,
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: GpuState contains DX11 COM pointers created with
+// D3D11_CREATE_DEVICE_SINGLETHREADED, which omits internal locking. This is
+// sound because the FFGL host guarantees single-threaded access per plugin
+// instance — no concurrent &self or &mut self calls ever occur.
 unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
@@ -276,7 +282,17 @@ impl GpuState {
             }
         }
 
-        self.intermediate_dims = (width, height);
+        // Only update cached dims if all textures and views were created
+        // successfully, otherwise the early-return check at the top of this
+        // method would skip recreation on the next call.
+        if self.tex_after_grayscale.is_some()
+            && self.tex_after_grayscale_srv.is_some()
+            && self.tex_after_grayscale_uav.is_some()
+            && self.tex_after_tint.is_some()
+            && self.tex_after_tint_srv.is_some()
+        {
+            self.intermediate_dims = (width, height);
+        }
     }
 }
 
@@ -431,7 +447,7 @@ pub struct DxKitchenSink {
     instance_id: u64,
 }
 
-// SAFETY: FFGL plugins are called single-threaded from the host.
+// SAFETY: See GpuState safety comment above.
 unsafe impl Send for DxKitchenSink {}
 unsafe impl Sync for DxKitchenSink {}
 
@@ -443,7 +459,7 @@ impl SimpleFFGLInstance for DxKitchenSink {
             *p = params_info[i].default_val();
         }
 
-        let s = Self {
+        Self {
             glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 params,
@@ -466,12 +482,7 @@ impl SimpleFFGLInstance for DxKitchenSink {
                 cbuf: None,
             },
             frame_counter: 0,
-            instance_id: 0,
-        };
-        let id = &s as *const _ as u64;
-        Self {
-            instance_id: id,
-            ..s
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
