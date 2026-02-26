@@ -27,7 +27,7 @@ use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -86,6 +86,9 @@ struct EffectParams {
     tint_saturation: f32,
     blend: f32,
 }
+
+// SAFETY: EffectParams is #[repr(C)] with only plain f32 fields.
+unsafe impl AsBytes for EffectParams {}
 
 /// Inner GPU state, separate from glium to avoid double-borrow.
 struct GpuState {
@@ -160,16 +163,13 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "macos")]
         {
-            use gpu_interop::metal::GlMetalBridge;
-
-            let (w, h) = bridge.dimensions();
+            let (w, h) = (input.width, input.height);
 
             // Ensure intermediate textures before borrowing pipelines.
             self.ensure_intermediate_textures(ctx, w, h);
@@ -187,19 +187,6 @@ impl GpuPlugin for GpuState {
                 None => return,
             };
 
-            let metal_bridge = match bridge.as_any_mut().downcast_mut::<GlMetalBridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_tex = match metal_bridge.input_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
-            let output_tex = match metal_bridge.output_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
             let after_gray = match &self.tex_after_grayscale {
                 Some(t) => t,
                 None => return,
@@ -215,12 +202,6 @@ impl GpuPlugin for GpuState {
                 tint_saturation: self.params[PARAM_TINT_SAT],
                 blend: self.params[PARAM_BLEND],
             };
-            let uniform_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &uniforms as *const EffectParams as *const u8,
-                    std::mem::size_of::<EffectParams>(),
-                )
-            };
 
             // Encode all three passes into a single command buffer.
             // Metal serialises encoders automatically — zero mid-frame waits.
@@ -234,9 +215,9 @@ impl GpuPlugin for GpuState {
                 .encode_compute_pass(
                     &cb,
                     grayscale_pl,
-                    &[input_tex, after_gray],
+                    &[input.input, after_gray],
                     &[],
-                    &[(uniform_bytes, 0)],
+                    &[(uniforms.as_bytes(), 0)],
                     (w as usize, h as usize),
                     (16, 16),
                 )
@@ -247,7 +228,13 @@ impl GpuPlugin for GpuState {
 
             // --- Pass 2: tint render (after_gray -> after_tint) ---
             if ctx
-                .encode_render_pass(&cb, tint_pl, after_tint, &[after_gray], &[(uniform_bytes, 0)])
+                .encode_render_pass(
+                    &cb,
+                    tint_pl,
+                    after_tint,
+                    &[after_gray],
+                    &[(uniforms.as_bytes(), 0)],
+                )
                 .is_err()
             {
                 return;
@@ -258,9 +245,9 @@ impl GpuPlugin for GpuState {
                 .encode_compute_pass(
                     &cb,
                     blend_pl,
-                    &[input_tex, after_tint, output_tex],
+                    &[input.input, after_tint, input.output],
                     &[],
-                    &[(uniform_bytes, 0)],
+                    &[(uniforms.as_bytes(), 0)],
                     (w as usize, h as usize),
                     (16, 16),
                 )
@@ -271,12 +258,12 @@ impl GpuPlugin for GpuState {
 
             // Single commit — all three passes submitted as one GPU unit.
             let pending = ctx.commit(cb);
-            metal_bridge.store_command_buffer(pending.into_command_buffer());
+            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }

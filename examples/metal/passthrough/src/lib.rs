@@ -13,7 +13,7 @@ use ffgl_glium::FFGLGlium;
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{DrawInput, GpuContext, draw_gpu_effect};
 
 /// Compiled Metal shader library, embedded at build time.
 #[cfg(target_os = "macos")]
@@ -37,54 +37,34 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "macos")]
         {
-            use gpu_interop::metal::GlMetalBridge;
-
             let pipeline = match &self.pipeline {
                 Some(p) => p,
                 None => return,
             };
 
-            // Get dimensions before downcasting (avoids borrow conflict).
-            let (w, h) = bridge.dimensions();
-
-            let metal_bridge = match bridge.as_any_mut().downcast_mut::<GlMetalBridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_tex = match metal_bridge.input_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
-            let output_tex = match metal_bridge.output_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
-
             let pending = match ctx.dispatch_compute(
                 pipeline,
-                &[input_tex, output_tex],
+                &[input.input, input.output],
                 &[],
                 &[],
-                (w as usize, h as usize),
+                (input.width as usize, input.height as usize),
                 (16, 16),
             ) {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            metal_bridge.store_command_buffer(pending.into_command_buffer());
+            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }

@@ -12,11 +12,11 @@
 //! different plugin instances from the same thread.
 
 use crate::context::GpuContext;
-use crate::plugin::GpuPlugin;
+use crate::plugin::{DrawInput, GpuPlugin};
 use ffgl_core::inputs::GLInput;
 use ffgl_core::FFGLData;
 use gl::types::{GLenum, GLint, GLuint};
-use gpu_interop::GpuBridge;
+use gpu_interop::GpuBridge as _;
 use std::cell::RefCell;
 use tracing::error;
 
@@ -312,7 +312,35 @@ mod metal_draw {
                         use_bilinear,
                     );
 
-                    plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
+                    // Extract texture references via raw pointers to avoid
+                    // conflicting borrows (shared refs to textures + mutable
+                    // ref to bridge in DrawInput).
+                    let input_ptr = match bridge.input_metal_texture() {
+                        Some(t) => t as *const _,
+                        None => return false,
+                    };
+                    let output_ptr = match bridge.output_metal_texture() {
+                        Some(t) => t as *const _,
+                        None => return false,
+                    };
+
+                    // SAFETY: The texture pointers point into bridge's internal
+                    // IOSurface-backed texture pairs. They remain valid for the
+                    // duration of gpu_draw because the bridge is held by this
+                    // scope and no bridge methods that invalidate textures are
+                    // called until after gpu_draw returns.
+                    let mut draw_input = DrawInput {
+                        input: unsafe { &*input_ptr },
+                        output: unsafe { &*output_ptr },
+                        width: proc_width,
+                        height: proc_height,
+                        bridge,
+                    };
+
+                    plugin.gpu_draw(ctx, &mut draw_input, data, frame_counter);
+
+                    // Reclaim bridge from DrawInput for post-draw operations.
+                    let bridge = draw_input.bridge;
 
                     bridge.mark_dispatch(frame_counter);
 
@@ -538,7 +566,33 @@ mod dx11_draw {
                     use_bilinear,
                 );
 
-                plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
+                // Extract owned COM refs from bridge (cheap AddRef).
+                let input_srv = match bridge.input_srv() {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let output_uav = match bridge.output_uav() {
+                    Some(u) => u,
+                    None => return false,
+                };
+                let output_texture = match bridge.output_texture() {
+                    Some(t) => t,
+                    None => return false,
+                };
+
+                let mut draw_input = DrawInput {
+                    input_srv,
+                    output_uav,
+                    output_texture,
+                    width: proc_width,
+                    height: proc_height,
+                    bridge,
+                };
+
+                plugin.gpu_draw(ctx, &mut draw_input, data, frame_counter);
+
+                // Reclaim bridge from DrawInput for post-draw operations.
+                let bridge = draw_input.bridge;
 
                 bridge.mark_dispatch(frame_counter);
 

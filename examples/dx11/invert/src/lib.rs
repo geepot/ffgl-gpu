@@ -12,7 +12,7 @@ use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::RenderPipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{DrawInput, GpuContext, draw_gpu_effect};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -48,41 +48,28 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "windows")]
         {
-            use gpu_interop::dx11::GlDx11Bridge;
-
             let pipeline = match &self.pipeline {
                 Some(p) => p,
                 None => return,
             };
 
-            let dx_bridge = match bridge.as_any_mut().downcast_mut::<GlDx11Bridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_srv = match dx_bridge.input_srv() {
-                Some(srv) => srv,
-                None => return,
-            };
-
-            let output_texture = match dx_bridge.output_texture() {
-                Some(tex) => tex,
-                None => return,
-            };
-
-            let _ = ctx.dispatch_render(pipeline, output_texture, &[Some(input_srv)], &[]);
+            let _ = ctx.dispatch_render(
+                pipeline,
+                input.output_texture.clone(),
+                &[Some(input.input_srv.clone())],
+                &[],
+            );
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }

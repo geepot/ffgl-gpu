@@ -17,12 +17,10 @@ use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(target_os = "windows")]
-use gpu_interop::dx11::GlDx11Bridge;
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
 #[cfg(target_os = "windows")]
@@ -64,6 +62,9 @@ fn cached_params() -> &'static [SimpleParamInfo] {
 struct BlurParams {
     radius: i32,
 }
+
+// SAFETY: BlurParams is #[repr(C)] with only plain numeric fields.
+unsafe impl AsBytes for BlurParams {}
 
 /// Inner GPU state, separate from glium to avoid double-borrow.
 struct GpuState {
@@ -215,33 +216,18 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "windows")]
         {
-            let (w, h) = bridge.dimensions();
-
-            let dx11_bridge = match bridge.as_any_mut().downcast_mut::<GlDx11Bridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_srv = match dx11_bridge.input_srv() {
-                Some(s) => s,
-                None => return,
-            };
-            let output_uav = match dx11_bridge.output_uav() {
-                Some(u) => u,
-                None => return,
-            };
+            let (w, h) = (input.width, input.height);
 
             // Get the device reference for ensure_intermediate_texture.
-            // Clone the COM pointer so we don't hold a borrow on the bridge.
-            let device = dx11_bridge.device().clone();
-            let dx11_context = dx11_bridge.context().clone();
+            let bridge = input.dx11_bridge();
+            let device = bridge.device().clone();
+            let dx11_context = bridge.context().clone();
 
             // Ensure intermediate texture is allocated at the correct size.
             self.ensure_intermediate_texture(&device, w, h);
@@ -260,15 +246,9 @@ impl GpuPlugin for GpuState {
             let params = BlurParams {
                 radius: pixel_radius,
             };
-            let params_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &params as *const BlurParams as *const u8,
-                    std::mem::size_of::<BlurParams>(),
-                )
-            };
 
             // Update the constant buffer with the current blur radius.
-            self.update_cbuf(&dx11_context, params_bytes);
+            self.update_cbuf(&dx11_context, params.as_bytes());
 
             let cbuf_ref = match &self.cbuf {
                 Some(b) => b.clone(),
@@ -291,7 +271,7 @@ impl GpuPlugin for GpuState {
             ctx.dispatch_compute(
                 h_pipeline,
                 &[Some(intermediate_uav)],
-                &[Some(input_srv)],
+                &[Some(input.input_srv.clone())],
                 &[Some(cbuf_ref.clone())],
                 (w as usize, h as usize),
                 (16, 16),
@@ -300,7 +280,7 @@ impl GpuPlugin for GpuState {
             // Pass 2: vertical blur (intermediate -> output)
             ctx.dispatch_compute(
                 v_pipeline,
-                &[Some(output_uav)],
+                &[Some(input.output_uav.clone())],
                 &[Some(intermediate_srv)],
                 &[Some(cbuf_ref)],
                 (w as usize, h as usize),
@@ -310,7 +290,7 @@ impl GpuPlugin for GpuState {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }

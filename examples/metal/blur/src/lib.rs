@@ -16,7 +16,7 @@ use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -46,6 +46,9 @@ fn cached_params() -> &'static [SimpleParamInfo] {
 struct BlurParams {
     radius: i32,
 }
+
+// SAFETY: BlurParams is #[repr(C)] with only plain numeric fields.
+unsafe impl AsBytes for BlurParams {}
 
 /// Inner GPU state, separate from glium to avoid double-borrow.
 struct GpuState {
@@ -93,16 +96,13 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "macos")]
         {
-            use gpu_interop::metal::GlMetalBridge;
-
-            let (w, h) = bridge.dimensions();
+            let (w, h) = (input.width, input.height);
 
             // Ensure intermediate texture before borrowing pipelines.
             self.ensure_intermediate_texture(ctx, w, h);
@@ -115,20 +115,6 @@ impl GpuPlugin for GpuState {
                 Some(p) => p,
                 None => return,
             };
-
-            let metal_bridge = match bridge.as_any_mut().downcast_mut::<GlMetalBridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_tex = match metal_bridge.input_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
-            let output_tex = match metal_bridge.output_metal_texture() {
-                Some(t) => t,
-                None => return,
-            };
             let intermediate_tex = match &self.intermediate_texture {
                 Some(t) => t,
                 None => return,
@@ -137,12 +123,6 @@ impl GpuPlugin for GpuState {
             let pixel_radius = (self.radius_param * MAX_RADIUS).round() as i32;
             let params = BlurParams {
                 radius: pixel_radius,
-            };
-            let params_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &params as *const BlurParams as *const u8,
-                    std::mem::size_of::<BlurParams>(),
-                )
             };
 
             // Encode both passes into a single command buffer — no mid-frame wait.
@@ -156,9 +136,9 @@ impl GpuPlugin for GpuState {
                 .encode_compute_pass(
                     &cb,
                     h_pipeline,
-                    &[input_tex, intermediate_tex],
+                    &[input.input, intermediate_tex],
                     &[],
-                    &[(params_bytes, 0)],
+                    &[(params.as_bytes(), 0)],
                     (w as usize, h as usize),
                     (16, 16),
                 )
@@ -172,9 +152,9 @@ impl GpuPlugin for GpuState {
                 .encode_compute_pass(
                     &cb,
                     v_pipeline,
-                    &[intermediate_tex, output_tex],
+                    &[intermediate_tex, input.output],
                     &[],
-                    &[(params_bytes, 0)],
+                    &[(params.as_bytes(), 0)],
                     (w as usize, h as usize),
                     (16, 16),
                 )
@@ -185,12 +165,12 @@ impl GpuPlugin for GpuState {
 
             // Single commit for both passes.
             let pending = ctx.commit(cb);
-            metal_bridge.store_command_buffer(pending.into_command_buffer());
+            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }

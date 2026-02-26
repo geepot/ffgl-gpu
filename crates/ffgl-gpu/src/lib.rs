@@ -25,6 +25,7 @@
 
 pub mod buffer;
 pub mod build_support;
+pub mod bytes;
 pub mod context;
 pub mod dispatch;
 pub mod drawing;
@@ -33,8 +34,9 @@ pub mod plugin;
 
 // Re-export primary types at crate root for convenience.
 pub use buffer::GpuBuffer;
+pub use bytes::AsBytes;
 pub use context::GpuContext;
 pub use dispatch::{Binding, CommandBuffer, PendingWork};
 pub use drawing::{draw_gpu_effect, ensure_instance_gl_resources, validate_gl_state_before_draw};
 pub use pipeline::{ComputePipeline, RenderPipeline};
-pub use plugin::GpuPlugin;
+pub use plugin::{DrawInput, GpuPlugin};

@@ -28,7 +28,7 @@ use ffgl_core::{FFGLData, GLInput};
 use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{GpuContext, draw_gpu_effect};
+use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -105,6 +105,9 @@ struct EffectParams {
     tint_saturation: f32,
     blend: f32,
 }
+
+// SAFETY: EffectParams is #[repr(C)] with only plain f32 fields.
+unsafe impl AsBytes for EffectParams {}
 
 // ---------------------------------------------------------------------------
 // GPU state
@@ -319,17 +322,13 @@ impl GpuPlugin for GpuState {
     fn gpu_draw(
         &mut self,
         ctx: &GpuContext,
-        bridge: &mut dyn gpu_interop::GpuBridge,
+        input: &mut DrawInput<'_>,
         _data: &FFGLData,
-        _input: &GLInput<'_>,
         _frame: u64,
     ) {
         #[cfg(target_os = "windows")]
         {
-            use gpu_interop::dx11::GlDx11Bridge;
-            use windows::Win32::Graphics::Direct3D11::*;
-
-            let (w, h) = bridge.dimensions();
+            let (w, h) = (input.width, input.height);
 
             // Ensure intermediate textures before borrowing pipelines.
             self.ensure_intermediate_textures(ctx, w, h);
@@ -344,20 +343,6 @@ impl GpuPlugin for GpuState {
             };
             let blend_pl = match &self.blend_pipeline {
                 Some(p) => p,
-                None => return,
-            };
-
-            let dx_bridge = match bridge.as_any_mut().downcast_mut::<GlDx11Bridge>() {
-                Some(b) => b,
-                None => return,
-            };
-
-            let input_srv = match dx_bridge.input_srv() {
-                Some(srv) => srv,
-                None => return,
-            };
-            let output_uav = match dx_bridge.output_uav() {
-                Some(uav) => uav,
                 None => return,
             };
 
@@ -389,13 +374,7 @@ impl GpuPlugin for GpuState {
                 tint_saturation: self.params[PARAM_TINT_SAT],
                 blend: self.params[PARAM_BLEND],
             };
-            let uniform_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &uniforms as *const EffectParams as *const u8,
-                    std::mem::size_of::<EffectParams>(),
-                )
-            };
-            ctx.update_constant_buffer(&cbuf, uniform_bytes);
+            ctx.update_constant_buffer(&cbuf, uniforms.as_bytes());
 
             let grid = (w as usize, h as usize);
             let threadgroup = (16, 16);
@@ -404,7 +383,7 @@ impl GpuPlugin for GpuState {
             ctx.dispatch_compute(
                 grayscale_pl,
                 &[Some(after_gray_uav)],
-                &[Some(input_srv.clone())],
+                &[Some(input.input_srv.clone())],
                 &[Some(cbuf.clone())],
                 grid,
                 threadgroup,
@@ -421,8 +400,8 @@ impl GpuPlugin for GpuState {
             // --- Pass 3: blend compute (input + after_tint -> output) ---
             ctx.dispatch_compute(
                 blend_pl,
-                &[Some(output_uav)],
-                &[Some(input_srv), Some(after_tint_srv)],
+                &[Some(input.output_uav.clone())],
+                &[Some(input.input_srv.clone()), Some(after_tint_srv)],
                 &[Some(cbuf)],
                 grid,
                 threadgroup,
@@ -431,7 +410,7 @@ impl GpuPlugin for GpuState {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (ctx, bridge);
+            let _ = (ctx, input);
         }
     }
 }
