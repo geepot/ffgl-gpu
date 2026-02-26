@@ -30,18 +30,18 @@ pub enum Binding<'a> {
 // Compute pass — in-progress compute encoding
 // ---------------------------------------------------------------------------
 
-/// An in-progress compute pass.
+/// A command buffer for encoding multiple passes.
 ///
-/// On macOS this holds the command buffer and compute command encoder. On
-/// Windows this is a zero-sized marker (D3D11 immediate context is stateful).
-pub struct ComputePass {
+/// On macOS this wraps a `MTLCommandBuffer`. Create one with
+/// [`GpuContext::create_command_buffer`], encode compute and render passes
+/// on it, then call [`GpuContext::commit`] to submit all work at once.
+///
+/// Metal automatically serialises encoders on the same command buffer, so
+/// there is no need for mid-frame `PendingWork::wait()` calls between passes.
+pub struct CommandBuffer {
     #[cfg(target_os = "macos")]
-    pub(crate) command_buffer:
+    pub(crate) inner:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
-    #[cfg(target_os = "macos")]
-    pub(crate) encoder: objc2::rc::Retained<
-        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-    >,
 }
 
 /// A token representing GPU work that has been submitted but may not yet be
@@ -91,6 +91,55 @@ mod metal_impl {
         [-1.0, 1.0, 0.0, 0.0],  // top-left
         [1.0, 1.0, 1.0, 0.0],   // top-right
     ];
+
+    /// Encode a compute dispatch onto `encoder`: set pipeline, bind resources,
+    /// dispatch threads, and end the encoder.
+    fn encode_compute_inner(
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pipeline: &ComputePipeline,
+        textures: &[&ProtocolObject<dyn MTLTexture>],
+        buffers: &[(&GpuBuffer, usize)],
+        bytes: &[(&[u8], usize)],
+        grid: (usize, usize),
+        threadgroup: (usize, usize),
+    ) {
+        encoder.setComputePipelineState(&pipeline.state);
+
+        for (i, tex) in textures.iter().enumerate() {
+            unsafe {
+                encoder.setTexture_atIndex(Some(*tex), i);
+            }
+        }
+
+        for (buf, idx) in buffers {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&buf.metal), 0, *idx);
+            }
+        }
+
+        for (data, idx) in bytes {
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
+                    data.len(),
+                    *idx,
+                );
+            }
+        }
+
+        let grid_size = MTLSize {
+            width: grid.0,
+            height: grid.1,
+            depth: 1,
+        };
+        let tg_size = MTLSize {
+            width: threadgroup.0,
+            height: threadgroup.1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
+        encoder.endEncoding();
+    }
 
     impl GpuContext {
         /// Create a compute pipeline from a named kernel function in the loaded
@@ -229,9 +278,21 @@ mod metal_impl {
             })
         }
 
-        /// Begin a compute pass: create a command buffer and compute command
-        /// encoder.
-        pub fn begin_compute_pass(&self) -> Result<ComputePass> {
+        /// Dispatch a single compute pass: create a command buffer, encode
+        /// the pipeline with all bindings, dispatch, commit, and return a
+        /// [`PendingWork`] token.
+        ///
+        /// Textures are bound sequentially starting at index 0. Buffers and
+        /// bytes are bound at their specified slot indices.
+        pub fn dispatch_compute(
+            &self,
+            pipeline: &ComputePipeline,
+            textures: &[&ProtocolObject<dyn MTLTexture>],
+            buffers: &[(&GpuBuffer, usize)],
+            bytes: &[(&[u8], usize)],
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) -> Result<PendingWork> {
             let command_buffer = self
                 .device
                 .command_queue()
@@ -242,126 +303,12 @@ mod metal_impl {
                 .computeCommandEncoder()
                 .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
 
-            Ok(ComputePass {
-                command_buffer,
-                encoder,
-            })
-        }
+            encode_compute_inner(
+                &encoder, pipeline, textures, buffers, bytes, grid, threadgroup,
+            );
 
-        /// Set a compute pipeline on the given pass.
-        pub fn set_compute_pipeline(&self, pass: &ComputePass, pipeline: &ComputePipeline) {
-            pass.encoder.setComputePipelineState(&pipeline.state);
-        }
-
-        /// Bind a buffer at the given index on a compute pass.
-        pub fn bind_buffer(&self, pass: &ComputePass, buffer: &GpuBuffer, index: usize) {
-            unsafe {
-                pass.encoder
-                    .setBuffer_offset_atIndex(Some(&buffer.metal), 0, index);
-            }
-        }
-
-        /// Bind a Metal texture at the given index on a compute pass.
-        ///
-        /// The `texture` must be a `&ProtocolObject<dyn MTLTexture>`.
-        pub fn bind_texture(
-            &self,
-            pass: &ComputePass,
-            texture: &ProtocolObject<dyn MTLTexture>,
-            index: usize,
-        ) {
-            unsafe {
-                pass.encoder.setTexture_atIndex(Some(texture), index);
-            }
-        }
-
-        /// Bind inline bytes as a constant buffer at the given index.
-        pub fn bind_bytes(&self, pass: &ComputePass, data: &[u8], index: usize) {
-            unsafe {
-                pass.encoder.setBytes_length_atIndex(
-                    std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
-                    data.len(),
-                    index,
-                );
-            }
-        }
-
-        /// Dispatch a 2D compute grid.
-        ///
-        /// `grid` is the total number of threads (width, height), and
-        /// `threadgroup` is the threadgroup size. The encoder will compute the
-        /// correct number of threadgroups.
-        pub fn dispatch_threads(
-            &self,
-            pass: &ComputePass,
-            grid: (usize, usize),
-            threadgroup: (usize, usize),
-        ) {
-            let grid_size = MTLSize {
-                width: grid.0,
-                height: grid.1,
-                depth: 1,
-            };
-            let tg_size = MTLSize {
-                width: threadgroup.0,
-                height: threadgroup.1,
-                depth: 1,
-            };
-            pass.encoder
-                .dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
-        }
-
-        /// Dispatch a 1D compute grid.
-        pub fn dispatch_threads_1d(
-            &self,
-            pass: &ComputePass,
-            thread_count: usize,
-            threadgroup_size: usize,
-        ) {
-            let grid_size = MTLSize {
-                width: thread_count,
-                height: 1,
-                depth: 1,
-            };
-            let tg_size = MTLSize {
-                width: threadgroup_size,
-                height: 1,
-                depth: 1,
-            };
-            pass.encoder
-                .dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
-        }
-
-        /// Dispatch threadgroups (indirect grid size, explicit threadgroup
-        /// count).
-        pub fn dispatch_threadgroups(
-            &self,
-            pass: &ComputePass,
-            threadgroups: (usize, usize),
-            threadgroup_size: (usize, usize),
-        ) {
-            let tg_count = MTLSize {
-                width: threadgroups.0,
-                height: threadgroups.1,
-                depth: 1,
-            };
-            let tg_size = MTLSize {
-                width: threadgroup_size.0,
-                height: threadgroup_size.1,
-                depth: 1,
-            };
-            pass.encoder
-                .dispatchThreadgroups_threadsPerThreadgroup(tg_count, tg_size);
-        }
-
-        /// End the compute pass, commit the command buffer, and return a
-        /// [`PendingWork`] token for synchronization.
-        pub fn end_compute_pass(&self, pass: ComputePass) -> PendingWork {
-            pass.encoder.endEncoding();
-            pass.command_buffer.commit();
-            PendingWork {
-                command_buffer: pass.command_buffer,
-            }
+            command_buffer.commit();
+            Ok(PendingWork { command_buffer })
         }
 
         /// Dispatch a fullscreen render pass: renders a quad using the given
@@ -435,6 +382,136 @@ mod metal_impl {
             Ok(PendingWork {
                 command_buffer,
             })
+        }
+
+        // =================================================================
+        // Multi-pass command buffer API
+        // =================================================================
+
+        /// Create a command buffer for encoding multiple passes.
+        ///
+        /// Use [`begin_compute_encoder`](Self::begin_compute_encoder),
+        /// [`encode_render_pass`](Self::encode_render_pass), and
+        /// [`commit`](Self::commit) to build and submit a multi-pass
+        /// pipeline in a single GPU submission with zero mid-frame stalls.
+        pub fn create_command_buffer(&self) -> Result<CommandBuffer> {
+            let inner = self
+                .device
+                .command_queue()
+                .commandBuffer()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal command buffer"))?;
+            Ok(CommandBuffer { inner })
+        }
+
+        /// Encode a compute pass on an existing command buffer.
+        ///
+        /// Same encoding as [`dispatch_compute`](Self::dispatch_compute) but
+        /// targets the given [`CommandBuffer`] instead of creating a new one.
+        /// Call [`commit`](Self::commit) after encoding all passes.
+        ///
+        /// Textures are bound sequentially starting at index 0. Buffers and
+        /// bytes are bound at their specified slot indices.
+        pub fn encode_compute_pass(
+            &self,
+            cb: &CommandBuffer,
+            pipeline: &ComputePipeline,
+            textures: &[&ProtocolObject<dyn MTLTexture>],
+            buffers: &[(&GpuBuffer, usize)],
+            bytes: &[(&[u8], usize)],
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) -> Result<()> {
+            let encoder = cb
+                .inner
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
+
+            encode_compute_inner(
+                &encoder, pipeline, textures, buffers, bytes, grid, threadgroup,
+            );
+
+            Ok(())
+        }
+
+        /// Encode a fullscreen render pass on an existing command buffer.
+        ///
+        /// Same rendering as [`dispatch_render`](Self::dispatch_render) but
+        /// encodes onto the given [`CommandBuffer`] instead of creating a
+        /// new one, avoiding an extra GPU submission boundary.
+        pub fn encode_render_pass(
+            &self,
+            cb: &CommandBuffer,
+            pipeline: &RenderPipeline,
+            output_texture: &ProtocolObject<dyn MTLTexture>,
+            fragment_textures: &[&ProtocolObject<dyn MTLTexture>],
+            fragment_bytes: &[(&[u8], usize)],
+        ) -> Result<()> {
+            let render_desc = MTLRenderPassDescriptor::new();
+            {
+                let attachment = unsafe {
+                    render_desc
+                        .colorAttachments()
+                        .objectAtIndexedSubscript(0)
+                };
+                attachment.setTexture(Some(output_texture));
+                attachment.setLoadAction(MTLLoadAction::DontCare);
+                attachment.setStoreAction(MTLStoreAction::Store);
+            }
+
+            let encoder = cb
+                .inner
+                .renderCommandEncoderWithDescriptor(&render_desc)
+                .ok_or_else(|| anyhow::anyhow!("Failed to create render encoder"))?;
+
+            encoder.setRenderPipelineState(&pipeline.state);
+
+            // Bind fullscreen quad vertex buffer at index 0
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(Some(&pipeline.quad_vb), 0, 0);
+            }
+
+            // Bind fragment textures
+            for (i, tex) in fragment_textures.iter().enumerate() {
+                unsafe {
+                    encoder.setFragmentTexture_atIndex(Some(*tex), i);
+                }
+            }
+
+            // Bind fragment constant data
+            for (data, index) in fragment_bytes {
+                unsafe {
+                    encoder.setFragmentBytes_length_atIndex(
+                        std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
+                        data.len(),
+                        *index,
+                    );
+                }
+            }
+
+            // Draw fullscreen quad as triangle strip (4 vertices)
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+            }
+
+            encoder.endEncoding();
+            Ok(())
+        }
+
+        /// Commit a command buffer and return a [`PendingWork`] token.
+        ///
+        /// Call this after encoding all passes. The returned token can be
+        /// stored via
+        /// [`GlMetalBridge::store_command_buffer`](gpu_interop::metal::GlMetalBridge::store_command_buffer)
+        /// for pipelined double-buffered synchronisation.
+        pub fn commit(&self, cb: CommandBuffer) -> PendingWork {
+            cb.inner.commit();
+            PendingWork {
+                command_buffer: cb.inner,
+            }
         }
     }
 }

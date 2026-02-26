@@ -145,31 +145,46 @@ impl GpuPlugin for GpuState {
                 )
             };
 
-            // Pass 1: horizontal blur (input -> intermediate)
-            let pass = match ctx.begin_compute_pass() {
-                Ok(p) => p,
+            // Encode both passes into a single command buffer — no mid-frame wait.
+            let cb = match ctx.create_command_buffer() {
+                Ok(cb) => cb,
                 Err(_) => return,
             };
-            ctx.set_compute_pipeline(&pass, h_pipeline);
-            ctx.bind_texture(&pass, input_tex, 0);
-            ctx.bind_texture(&pass, intermediate_tex, 1);
-            ctx.bind_bytes(&pass, params_bytes, 0);
-            ctx.dispatch_threads(&pass, (w as usize, h as usize), (16, 16));
-            let pending = ctx.end_compute_pass(pass);
-            pending.wait();
+
+            // Pass 1: horizontal blur (input -> intermediate)
+            if ctx
+                .encode_compute_pass(
+                    &cb,
+                    h_pipeline,
+                    &[input_tex, intermediate_tex],
+                    &[],
+                    &[(params_bytes, 0)],
+                    (w as usize, h as usize),
+                    (16, 16),
+                )
+                .is_err()
+            {
+                return;
+            }
 
             // Pass 2: vertical blur (intermediate -> output)
-            let pass = match ctx.begin_compute_pass() {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            ctx.set_compute_pipeline(&pass, v_pipeline);
-            ctx.bind_texture(&pass, intermediate_tex, 0);
-            ctx.bind_texture(&pass, output_tex, 1);
-            ctx.bind_bytes(&pass, params_bytes, 0);
-            ctx.dispatch_threads(&pass, (w as usize, h as usize), (16, 16));
+            if ctx
+                .encode_compute_pass(
+                    &cb,
+                    v_pipeline,
+                    &[intermediate_tex, output_tex],
+                    &[],
+                    &[(params_bytes, 0)],
+                    (w as usize, h as usize),
+                    (16, 16),
+                )
+                .is_err()
+            {
+                return;
+            }
 
-            let pending = ctx.end_compute_pass(pass);
+            // Single commit for both passes.
+            let pending = ctx.commit(cb);
             metal_bridge.store_command_buffer(pending.into_command_buffer());
         }
 

@@ -976,6 +976,8 @@ impl Drop for GlDx11Bridge {
         self.pending_dispatch = false;
         self.destroy_pairs();
         unsafe {
+            // Unbind before deleting to avoid undefined GL state on some drivers.
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             if self.read_fbo != 0 {
                 gl::DeleteFramebuffers(1, &self.read_fbo);
             }

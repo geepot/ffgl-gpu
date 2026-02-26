@@ -550,7 +550,7 @@ impl GpuBridge for GlMetalBridge {
     }
 
     fn wait_for_pending(&mut self) {
-        if let Some(cb) = self.pending_command_buffer.take() {
+        if let Some(cb) = self.pending_command_buffer.as_ref() {
             cb.waitUntilCompleted();
         }
     }

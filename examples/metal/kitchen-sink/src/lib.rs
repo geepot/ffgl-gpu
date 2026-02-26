@@ -222,44 +222,55 @@ impl GpuPlugin for GpuState {
                 )
             };
 
-            // --- Pass 1: grayscale compute (input -> after_gray) ---
-            let pass = match ctx.begin_compute_pass() {
-                Ok(p) => p,
+            // Encode all three passes into a single command buffer.
+            // Metal serialises encoders automatically — zero mid-frame waits.
+            let cb = match ctx.create_command_buffer() {
+                Ok(cb) => cb,
                 Err(_) => return,
             };
-            ctx.set_compute_pipeline(&pass, grayscale_pl);
-            ctx.bind_texture(&pass, input_tex, 0);
-            ctx.bind_texture(&pass, after_gray, 1);
-            ctx.bind_bytes(&pass, uniform_bytes, 0);
-            ctx.dispatch_threads(&pass, (w as usize, h as usize), (16, 16));
-            let pending = ctx.end_compute_pass(pass);
-            pending.wait();
+
+            // --- Pass 1: grayscale compute (input -> after_gray) ---
+            if ctx
+                .encode_compute_pass(
+                    &cb,
+                    grayscale_pl,
+                    &[input_tex, after_gray],
+                    &[],
+                    &[(uniform_bytes, 0)],
+                    (w as usize, h as usize),
+                    (16, 16),
+                )
+                .is_err()
+            {
+                return;
+            }
 
             // --- Pass 2: tint render (after_gray -> after_tint) ---
-            let pending = match ctx.dispatch_render(
-                tint_pl,
-                after_tint,
-                &[after_gray],
-                &[(uniform_bytes, 0)],
-            ) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            pending.wait();
+            if ctx
+                .encode_render_pass(&cb, tint_pl, after_tint, &[after_gray], &[(uniform_bytes, 0)])
+                .is_err()
+            {
+                return;
+            }
 
             // --- Pass 3: blend compute (original + after_tint -> output) ---
-            let pass = match ctx.begin_compute_pass() {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            ctx.set_compute_pipeline(&pass, blend_pl);
-            ctx.bind_texture(&pass, input_tex, 0);
-            ctx.bind_texture(&pass, after_tint, 1);
-            ctx.bind_texture(&pass, output_tex, 2);
-            ctx.bind_bytes(&pass, uniform_bytes, 0);
-            ctx.dispatch_threads(&pass, (w as usize, h as usize), (16, 16));
+            if ctx
+                .encode_compute_pass(
+                    &cb,
+                    blend_pl,
+                    &[input_tex, after_tint, output_tex],
+                    &[],
+                    &[(uniform_bytes, 0)],
+                    (w as usize, h as usize),
+                    (16, 16),
+                )
+                .is_err()
+            {
+                return;
+            }
 
-            let pending = ctx.end_compute_pass(pass);
+            // Single commit — all three passes submitted as one GPU unit.
+            let pending = ctx.commit(cb);
             metal_bridge.store_command_buffer(pending.into_command_buffer());
         }
 

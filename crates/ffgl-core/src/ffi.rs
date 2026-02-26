@@ -295,7 +295,16 @@ pub unsafe fn copy_str_to_host_buffer(address: *mut u8, max_to_write: usize, str
         return;
     }
 
-    let cstr = CString::new(string).unwrap().into_bytes_with_nul();
+    let cstr = match CString::new(string) {
+        Ok(c) => c.into_bytes_with_nul(),
+        Err(_) => {
+            // String contains interior null bytes; replace them with spaces.
+            let sanitized: String = string.chars().map(|c| if c == '\0' { ' ' } else { c }).collect();
+            CString::new(sanitized)
+                .unwrap_or_else(|_| CString::new("").unwrap())
+                .into_bytes_with_nul()
+        }
+    };
     let to_copy = cstr.len().min(max_to_write);
     let dest = unsafe { std::slice::from_raw_parts_mut(address, to_copy) };
 

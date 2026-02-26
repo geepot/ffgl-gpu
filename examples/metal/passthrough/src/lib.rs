@@ -68,17 +68,17 @@ impl GpuPlugin for GpuState {
                 None => return,
             };
 
-            let pass = match ctx.begin_compute_pass() {
+            let pending = match ctx.dispatch_compute(
+                pipeline,
+                &[input_tex, output_tex],
+                &[],
+                &[],
+                (w as usize, h as usize),
+                (16, 16),
+            ) {
                 Ok(p) => p,
                 Err(_) => return,
             };
-
-            ctx.set_compute_pipeline(&pass, pipeline);
-            ctx.bind_texture(&pass, input_tex, 0);
-            ctx.bind_texture(&pass, output_tex, 1);
-            ctx.dispatch_threads(&pass, (w as usize, h as usize), (16, 16));
-
-            let pending = ctx.end_compute_pass(pass);
             metal_bridge.store_command_buffer(pending.into_command_buffer());
         }
 

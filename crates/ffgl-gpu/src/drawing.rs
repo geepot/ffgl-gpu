@@ -229,8 +229,8 @@ mod metal_draw {
                 let ctx_ref = ctx_cell.borrow();
                 let ctx = ctx_ref.as_ref().unwrap();
 
-                // Initialize bridge if needed
                 BRIDGE.with(|bridge_cell| {
+                    // Initialize bridge if needed (separate borrow scope)
                     {
                         let mut bridge_opt = bridge_cell.borrow_mut();
                         if bridge_opt.is_none() {
@@ -251,16 +251,6 @@ mod metal_draw {
                                 unsafe { objc2::rc::Retained::retain(device_ptr) }
                                     .expect("device pointer must be non-null");
                             *bridge_opt = Some(GlMetalBridge::new(device_retained));
-                        }
-                    }
-
-                    // Ensure bridge dimensions
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        if let Err(e) = bridge.ensure_dimensions(proc_width, proc_height) {
-                            error!("Failed to ensure bridge dimensions: {e}");
-                            return false;
                         }
                     }
 
@@ -288,23 +278,20 @@ mod metal_draw {
                     }
 
                     // --- Double-buffered pipelined flow ---
-                    let has_prev = {
-                        let bridge = bridge_cell.borrow();
-                        let bridge = bridge.as_ref().unwrap();
-                        bridge.has_result_ready(frame_counter)
-                    };
+                    // Single mutable borrow for all bridge operations.
+                    let mut bridge_opt = bridge_cell.borrow_mut();
+                    let bridge = bridge_opt.as_mut().unwrap();
 
-                    // Wait for previous GPU work
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        bridge.wait_for_previous();
+                    if let Err(e) = bridge.ensure_dimensions(proc_width, proc_height) {
+                        error!("Failed to ensure bridge dimensions: {e}");
+                        return false;
                     }
 
-                    // If previous result is ready, swap and blit back output
+                    let has_prev = bridge.has_result_ready(frame_counter);
+
+                    bridge.wait_for_previous();
+
                     if has_prev {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
                         bridge.swap();
                         bridge.blit_back_output_to_target_scaled(
                             host_fbo,
@@ -316,38 +303,20 @@ mod metal_draw {
                         );
                     }
 
-                    // Blit host GL texture -> front input
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        bridge.blit_input_from_host_scaled(
-                            tex_id,
-                            width,
-                            height,
-                            proc_width,
-                            proc_height,
-                            use_bilinear,
-                        );
-                    }
+                    bridge.blit_input_from_host_scaled(
+                        tex_id,
+                        width,
+                        height,
+                        proc_width,
+                        proc_height,
+                        use_bilinear,
+                    );
 
-                    // Call plugin's gpu_draw
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
-                    }
+                    plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
 
-                    // Mark dispatch for pipelining
-                    {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
-                        bridge.mark_dispatch(frame_counter);
-                    }
+                    bridge.mark_dispatch(frame_counter);
 
-                    // First frame: sync blit front output to host
                     if !has_prev {
-                        let mut bridge_opt = bridge_cell.borrow_mut();
-                        let bridge = bridge_opt.as_mut().unwrap();
                         bridge.wait_for_pending();
                         bridge.blit_output_to_target_scaled(
                             host_fbo,
@@ -511,16 +480,6 @@ mod dx11_draw {
             let ctx = ctx_ref.as_ref().unwrap();
 
             BRIDGE.with(|bridge_cell| {
-                // Ensure shared textures are allocated at processing resolution
-                {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
-                    if let Err(e) = bridge.ensure_dimensions(proc_width, proc_height) {
-                        error!("Failed to ensure bridge dimensions: {e}");
-                        return false;
-                    }
-                }
-
                 // Call gpu_init on first use
                 let init_ok = GPU_INITIALIZED.with(|cell| {
                     let mut initialized = cell.borrow_mut();
@@ -545,23 +504,20 @@ mod dx11_draw {
                 }
 
                 // --- Double-buffered pipelined flow ---
-                let has_prev = {
-                    let bridge = bridge_cell.borrow();
-                    let bridge = bridge.as_ref().unwrap();
-                    bridge.has_result_ready(frame_counter)
-                };
+                // Single mutable borrow for all bridge operations.
+                let mut bridge_opt = bridge_cell.borrow_mut();
+                let bridge = bridge_opt.as_mut().unwrap();
 
-                // Wait for previous GPU work
-                {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
-                    bridge.wait_for_previous();
+                if let Err(e) = bridge.ensure_dimensions(proc_width, proc_height) {
+                    error!("Failed to ensure bridge dimensions: {e}");
+                    return false;
                 }
 
-                // If previous result is ready, swap and blit back output
+                let has_prev = bridge.has_result_ready(frame_counter);
+
+                bridge.wait_for_previous();
+
                 if has_prev {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
                     bridge.swap();
                     bridge.blit_back_output_to_target_scaled(
                         host_fbo,
@@ -573,38 +529,20 @@ mod dx11_draw {
                     );
                 }
 
-                // Blit host GL texture -> front input
-                {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
-                    bridge.blit_input_from_host_scaled(
-                        tex_id,
-                        width,
-                        height,
-                        proc_width,
-                        proc_height,
-                        use_bilinear,
-                    );
-                }
+                bridge.blit_input_from_host_scaled(
+                    tex_id,
+                    width,
+                    height,
+                    proc_width,
+                    proc_height,
+                    use_bilinear,
+                );
 
-                // Call plugin's gpu_draw
-                {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
-                    plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
-                }
+                plugin.gpu_draw(ctx, bridge, data, &frame_data, frame_counter);
 
-                // Mark dispatch for pipelining
-                {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
-                    bridge.mark_dispatch(frame_counter);
-                }
+                bridge.mark_dispatch(frame_counter);
 
-                // First frame: sync blit front output to host
                 if !has_prev {
-                    let mut bridge_opt = bridge_cell.borrow_mut();
-                    let bridge = bridge_opt.as_mut().unwrap();
                     bridge.wait_for_pending();
                     bridge.blit_output_to_target_scaled(
                         host_fbo,

@@ -26,7 +26,17 @@ static INFO: OnceLock<info::PluginInfo> = OnceLock::new();
 static INFO_STRUCT: OnceLock<PluginInfoStruct> = OnceLock::new();
 static ABOUT: OnceLock<CString> = OnceLock::new();
 static DESCRIPTION: OnceLock<CString> = OnceLock::new();
-static mut INFO_STRUCT_EXTENDED: Option<PluginExtendedInfoStruct> = None;
+
+/// Wrapper to allow `PluginExtendedInfoStruct` in a `OnceLock`.
+///
+/// SAFETY: The raw pointers inside `PluginExtendedInfoStruct` point to
+/// `&'static CStr` data allocated once and never freed. They are never written
+/// to or deallocated, so sharing across threads is safe.
+struct SyncExtendedInfo(PluginExtendedInfoStruct);
+unsafe impl Send for SyncExtendedInfo {}
+unsafe impl Sync for SyncExtendedInfo {}
+
+static INFO_STRUCT_EXTENDED: OnceLock<SyncExtendedInfo> = OnceLock::new();
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 static HANDLER: OnceLock<Box<dyn Any + Send + Sync>> = OnceLock::new();
 
@@ -80,9 +90,8 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
 
     // Initialize info structs
     let _info_struct = INFO_STRUCT.get_or_init(|| {
-        unsafe {
-            INFO_STRUCT_EXTENDED = Some(info::plugin_info_extended(about, description));
-        }
+        INFO_STRUCT_EXTENDED
+            .get_or_init(|| SyncExtendedInfo(info::plugin_info_extended(about, description)));
         info::plugin_info(
             // Safety: [u8; 4] and [i8; 4] have the same layout
             unsafe { &*(&plugin_info.unique_id as *const [u8; 4] as *const [i8; 4]) },
@@ -95,35 +104,35 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
     let resp = match function {
         Op::GetPluginCaps => {
             let cap_num = unsafe { input_value.num };
-            let cap = num::FromPrimitive::from_u32(cap_num).expect("Unexpected cap n{cap_num}");
+            let cap: Option<PluginCapacity> = num::FromPrimitive::from_u32(cap_num);
 
             let result = match cap {
-                PluginCapacity::MinInputFrames => FFGLVal { num: 0 },
-                PluginCapacity::MaxInputFrames => FFGLVal { num: 1 },
+                Some(PluginCapacity::MinInputFrames) => FFGLVal { num: 0 },
+                Some(PluginCapacity::MaxInputFrames) => FFGLVal { num: 1 },
 
-                PluginCapacity::ProcessOpenGl => SupportVal::Supported.into(),
-                PluginCapacity::SetTime => SupportVal::Supported.into(),
+                Some(PluginCapacity::ProcessOpenGl) => SupportVal::Supported.into(),
+                Some(PluginCapacity::SetTime) => SupportVal::Supported.into(),
 
-                PluginCapacity::TopLeftTextureOrientation => SupportVal::Supported.into(),
+                Some(PluginCapacity::TopLeftTextureOrientation) => SupportVal::Supported.into(),
 
                 _ => SupportVal::Unsupported.into(),
             };
 
-            debug!(r = unsafe { result.num }, "{cap:?}");
+            debug!(r = unsafe { result.num }, cap_num, "GetPluginCaps");
 
             result
         }
 
         Op::EnablePluginCap => {
             let cap_num = unsafe { input_value.num };
-            let cap = num::FromPrimitive::from_u32(cap_num).expect("Unexpected cap n{cap_num}");
+            let cap: Option<PluginCapacity> = num::FromPrimitive::from_u32(cap_num);
 
             let result: FFGLVal = match cap {
-                PluginCapacity::TopLeftTextureOrientation => SuccessVal::Success.into(),
+                Some(PluginCapacity::TopLeftTextureOrientation) => SuccessVal::Success.into(),
                 _ => SuccessVal::Fail.into(),
             };
 
-            debug!(r = unsafe { result.num }, "{cap:?}");
+            debug!(r = unsafe { result.num }, cap_num, "EnablePluginCap");
 
             result
         }
@@ -242,7 +251,10 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
 
         Op::GetInfo => INFO_STRUCT.get().context(e!("No info"))?.into(),
 
-        Op::GetExtendedInfo => (&raw mut INFO_STRUCT_EXTENDED).into(),
+        Op::GetExtendedInfo => {
+            let ext = INFO_STRUCT_EXTENDED.get().context(e!("No extended info"))?;
+            (&ext.0).into()
+        }
 
         Op::InstantiateGL => {
             let viewport: &FFGLViewportStruct = unsafe { input_value.as_ref() };
