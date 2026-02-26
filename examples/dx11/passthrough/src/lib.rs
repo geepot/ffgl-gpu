@@ -40,7 +40,7 @@ impl GpuPlugin for GpuState {
     fn gpu_init(&mut self, ctx: &GpuContext) -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
-            self.pipeline = Some(ctx.create_compute_pipeline_from_bytecode(COMPUTE_SHADER)?);
+            self.pipeline = Some(ctx.create_compute_pipeline(COMPUTE_SHADER)?);
         }
         let _ = ctx;
         Ok(())
@@ -78,14 +78,13 @@ impl GpuPlugin for GpuState {
                 None => return,
             };
 
-            let thread_groups = ((w + 15) / 16, (h + 15) / 16, 1);
-
             ctx.dispatch_compute(
                 pipeline,
                 &[Some(output_uav)],
                 &[Some(input_srv)],
                 &[],
-                thread_groups,
+                (w as usize, h as usize),
+                (16, 16),
             );
         }
 

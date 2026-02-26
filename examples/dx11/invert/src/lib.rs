@@ -39,8 +39,7 @@ impl GpuPlugin for GpuState {
     fn gpu_init(&mut self, ctx: &GpuContext) -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
-            self.pipeline =
-                Some(ctx.create_render_pipeline_from_bytecode(VS_SHADER, PS_SHADER)?);
+            self.pipeline = Some(ctx.create_render_pipeline(VS_SHADER, PS_SHADER)?);
         }
         let _ = ctx;
         Ok(())

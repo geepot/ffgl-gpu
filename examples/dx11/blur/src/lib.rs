@@ -201,8 +201,8 @@ impl GpuPlugin for GpuState {
     fn gpu_init(&mut self, ctx: &GpuContext) -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
-            self.h_pipeline = Some(ctx.create_compute_pipeline_from_bytecode(H_SHADER)?);
-            self.v_pipeline = Some(ctx.create_compute_pipeline_from_bytecode(V_SHADER)?);
+            self.h_pipeline = Some(ctx.create_compute_pipeline(H_SHADER)?);
+            self.v_pipeline = Some(ctx.create_compute_pipeline(V_SHADER)?);
             self.cbuf = gpu_interop::dx11::create_dynamic_cbuf(
                 ctx.dx11_device().device(),
                 std::mem::size_of::<BlurParams>(),
@@ -284,10 +284,6 @@ impl GpuPlugin for GpuState {
                 None => return,
             };
 
-            // Thread groups: ceil(w/16) x ceil(h/16) x 1
-            let groups_x = (w + 15) / 16;
-            let groups_y = (h + 15) / 16;
-
             // Pass 1: horizontal blur (input -> intermediate)
             // dispatch_compute unbinds all CS resources after each dispatch,
             // so the intermediate UAV is safely unbound before pass 2 binds
@@ -297,7 +293,8 @@ impl GpuPlugin for GpuState {
                 &[Some(intermediate_uav)],
                 &[Some(input_srv)],
                 &[Some(cbuf_ref.clone())],
-                (groups_x, groups_y, 1),
+                (w as usize, h as usize),
+                (16, 16),
             );
 
             // Pass 2: vertical blur (intermediate -> output)
@@ -306,7 +303,8 @@ impl GpuPlugin for GpuState {
                 &[Some(output_uav)],
                 &[Some(intermediate_srv)],
                 &[Some(cbuf_ref)],
-                (groups_x, groups_y, 1),
+                (w as usize, h as usize),
+                (16, 16),
             );
         }
 

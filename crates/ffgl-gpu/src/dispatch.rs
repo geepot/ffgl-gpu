@@ -539,7 +539,7 @@ mod dx11_impl {
 
     impl GpuContext {
         /// Create a compute pipeline from pre-compiled HLSL bytecode (`.cso`).
-        pub fn create_compute_pipeline_from_bytecode(
+        pub fn create_compute_pipeline(
             &self,
             bytecode: &[u8],
         ) -> Result<ComputePipeline> {
@@ -561,9 +561,9 @@ mod dx11_impl {
         /// shader bytecode (`.cso`).
         ///
         /// Sets up a fullscreen quad vertex buffer with `POSITION float2 +
-        /// TEXCOORD float2` layout and a linear/clamp sampler for pixel shader
-        /// texture sampling.
-        pub fn create_render_pipeline_from_bytecode(
+        /// TEXCOORD float2` layout and a linear/clamp sampler for fragment
+        /// shader texture sampling.
+        pub fn create_render_pipeline(
             &self,
             vs_bytecode: &[u8],
             ps_bytecode: &[u8],
@@ -756,17 +756,21 @@ mod dx11_impl {
         /// Dispatch a compute shader on the immediate context.
         ///
         /// Binds the compute shader, UAVs, SRVs, and constant buffers, then
-        /// dispatches the given number of thread groups. Unbinds all CS
-        /// resources after dispatch to prevent resource hazards in multi-pass
-        /// scenarios.
+        /// dispatches enough thread groups to cover `grid` total threads with
+        /// the given `threadgroup` size. Unbinds all CS resources after dispatch
+        /// to prevent resource hazards in multi-pass scenarios.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
             uavs: &[Option<ID3D11UnorderedAccessView>],
             srvs: &[Option<ID3D11ShaderResourceView>],
             cbufs: &[Option<ID3D11Buffer>],
-            thread_groups: (u32, u32, u32),
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
         ) {
+            let groups_x = ((grid.0 + threadgroup.0 - 1) / threadgroup.0) as u32;
+            let groups_y = ((grid.1 + threadgroup.1 - 1) / threadgroup.1) as u32;
+
             let ctx = self.device.context();
             unsafe {
                 ctx.CSSetShader(&pipeline.shader, None);
@@ -779,7 +783,7 @@ mod dx11_impl {
                 if !cbufs.is_empty() {
                     ctx.CSSetConstantBuffers(0, cbufs);
                 }
-                ctx.Dispatch(thread_groups.0, thread_groups.1, thread_groups.2);
+                ctx.Dispatch(groups_x, groups_y, 1);
 
                 // Unbind all CS resources to prevent hazards when the same
                 // texture is used as SRV in a subsequent pass.
@@ -801,8 +805,8 @@ mod dx11_impl {
             &self,
             pipeline: &RenderPipeline,
             output_texture: &ID3D11Texture2D,
-            pixel_srvs: &[Option<ID3D11ShaderResourceView>],
-            pixel_cbufs: &[Option<ID3D11Buffer>],
+            fragment_srvs: &[Option<ID3D11ShaderResourceView>],
+            fragment_cbufs: &[Option<ID3D11Buffer>],
         ) -> Result<()> {
             let device = self.device.device();
             let ctx = self.device.context();
@@ -849,13 +853,13 @@ mod dx11_impl {
                 // Vertex shader
                 ctx.VSSetShader(&pipeline.vs, None);
 
-                // Pixel shader
+                // Fragment (pixel) shader
                 ctx.PSSetShader(&pipeline.ps, None);
-                if !pixel_srvs.is_empty() {
-                    ctx.PSSetShaderResources(0, pixel_srvs);
+                if !fragment_srvs.is_empty() {
+                    ctx.PSSetShaderResources(0, fragment_srvs);
                 }
-                if !pixel_cbufs.is_empty() {
-                    ctx.PSSetConstantBuffers(0, pixel_cbufs);
+                if !fragment_cbufs.is_empty() {
+                    ctx.PSSetConstantBuffers(0, fragment_cbufs);
                 }
                 ctx.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
 

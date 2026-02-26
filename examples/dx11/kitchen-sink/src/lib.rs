@@ -304,12 +304,9 @@ impl GpuPlugin for GpuState {
     fn gpu_init(&mut self, ctx: &GpuContext) -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
-            self.grayscale_pipeline =
-                Some(ctx.create_compute_pipeline_from_bytecode(GRAYSCALE_CS)?);
-            self.tint_pipeline =
-                Some(ctx.create_render_pipeline_from_bytecode(TINT_VS, TINT_PS)?);
-            self.blend_pipeline =
-                Some(ctx.create_compute_pipeline_from_bytecode(BLEND_CS)?);
+            self.grayscale_pipeline = Some(ctx.create_compute_pipeline(GRAYSCALE_CS)?);
+            self.tint_pipeline = Some(ctx.create_render_pipeline(TINT_VS, TINT_PS)?);
+            self.blend_pipeline = Some(ctx.create_compute_pipeline(BLEND_CS)?);
             self.cbuf = gpu_interop::dx11::create_dynamic_cbuf(
                 ctx.dx11_device().device(),
                 std::mem::size_of::<EffectParams>(),
@@ -400,7 +397,8 @@ impl GpuPlugin for GpuState {
             };
             ctx.update_constant_buffer(&cbuf, uniform_bytes);
 
-            let thread_groups = ((w + 15) / 16, (h + 15) / 16, 1);
+            let grid = (w as usize, h as usize);
+            let threadgroup = (16, 16);
 
             // --- Pass 1: grayscale compute (input_srv -> after_gray_uav) ---
             ctx.dispatch_compute(
@@ -408,7 +406,8 @@ impl GpuPlugin for GpuState {
                 &[Some(after_gray_uav)],
                 &[Some(input_srv.clone())],
                 &[Some(cbuf.clone())],
-                thread_groups,
+                grid,
+                threadgroup,
             );
 
             // --- Pass 2: tint render (after_gray_srv -> after_tint texture) ---
@@ -425,7 +424,8 @@ impl GpuPlugin for GpuState {
                 &[Some(output_uav)],
                 &[Some(input_srv), Some(after_tint_srv)],
                 &[Some(cbuf)],
-                thread_groups,
+                grid,
+                threadgroup,
             );
         }
 
