@@ -561,8 +561,8 @@ mod dx11_impl {
         /// shader bytecode (`.cso`).
         ///
         /// Sets up a fullscreen quad vertex buffer with `POSITION float2 +
-        /// TEXCOORD float2` layout and a linear/clamp sampler for fragment
-        /// shader texture sampling.
+        /// TEXCOORD float2` layout and a linear/clamp sampler for pixel shader
+        /// texture sampling.
         pub fn create_render_pipeline(
             &self,
             vs_bytecode: &[u8],
@@ -805,8 +805,8 @@ mod dx11_impl {
             &self,
             pipeline: &RenderPipeline,
             output_texture: &ID3D11Texture2D,
-            fragment_srvs: &[Option<ID3D11ShaderResourceView>],
-            fragment_cbufs: &[Option<ID3D11Buffer>],
+            pixel_srvs: &[Option<ID3D11ShaderResourceView>],
+            pixel_cbufs: &[Option<ID3D11Buffer>],
         ) -> Result<()> {
             let device = self.device.device();
             let ctx = self.device.context();
@@ -853,13 +853,13 @@ mod dx11_impl {
                 // Vertex shader
                 ctx.VSSetShader(&pipeline.vs, None);
 
-                // Fragment (pixel) shader
+                // Pixel shader
                 ctx.PSSetShader(&pipeline.ps, None);
-                if !fragment_srvs.is_empty() {
-                    ctx.PSSetShaderResources(0, fragment_srvs);
+                if !pixel_srvs.is_empty() {
+                    ctx.PSSetShaderResources(0, pixel_srvs);
                 }
-                if !fragment_cbufs.is_empty() {
-                    ctx.PSSetConstantBuffers(0, fragment_cbufs);
+                if !pixel_cbufs.is_empty() {
+                    ctx.PSSetConstantBuffers(0, pixel_cbufs);
                 }
                 ctx.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
 
