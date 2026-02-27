@@ -12,21 +12,21 @@ use objc2_metal::{MTLBuffer, MTLComputePipelineState, MTLRenderPipelineState};
 
 /// A compiled compute pipeline (kernel).
 ///
-/// On macOS this wraps a `MTLComputePipelineState`. On Windows it wraps an
-/// `ID3D11ComputeShader`.
+/// On macOS this wraps a `MTLComputePipelineState`. On other platforms it
+/// wraps a GL program handle (linked compute shader).
 pub struct ComputePipeline {
     #[cfg(target_os = "macos")]
     pub(crate) state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
-    #[cfg(target_os = "windows")]
-    pub(crate) shader: windows::Win32::Graphics::Direct3D11::ID3D11ComputeShader,
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) program: gl::types::GLuint,
 }
 
 /// A compiled render pipeline (vertex + fragment).
 ///
 /// On macOS this wraps a `MTLRenderPipelineState` and a fullscreen quad vertex
-/// buffer. On Windows it wraps vertex and pixel shaders plus an input layout
-/// and vertex buffer.
+/// buffer. On other platforms it wraps a GL program handle plus a fullscreen
+/// quad VAO/VBO.
 #[allow(dead_code)]
 pub struct RenderPipeline {
     #[cfg(target_os = "macos")]
@@ -35,14 +35,10 @@ pub struct RenderPipeline {
     #[cfg(target_os = "macos")]
     pub(crate) quad_vb: Retained<ProtocolObject<dyn MTLBuffer>>,
 
-    #[cfg(target_os = "windows")]
-    pub(crate) vs: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
-    #[cfg(target_os = "windows")]
-    pub(crate) ps: windows::Win32::Graphics::Direct3D11::ID3D11PixelShader,
-    #[cfg(target_os = "windows")]
-    pub(crate) input_layout: windows::Win32::Graphics::Direct3D11::ID3D11InputLayout,
-    #[cfg(target_os = "windows")]
-    pub(crate) quad_vb: windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
-    #[cfg(target_os = "windows")]
-    pub(crate) sampler: windows::Win32::Graphics::Direct3D11::ID3D11SamplerState,
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) program: gl::types::GLuint,
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) quad_vao: gl::types::GLuint,
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) quad_vb: gl::types::GLuint,
 }
