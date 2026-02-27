@@ -161,12 +161,18 @@ pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
 
         // --- Transpile each entry point to GLSL 4.60 ---
         // Always generated (pure Rust, no platform dependency) so cross-compilation works.
+        //
+        // Build GLSL binding map: WGSL (group, binding) → GL binding point.
+        // Identity mapping so naga emits `layout(binding = N)` qualifiers,
+        // allowing dispatch code to bind to matching texture/image units.
+        let glsl_binding_map = build_glsl_binding_map(&module);
+
         for entry in file_entries.iter() {
             let mut glsl_source = String::new();
             let glsl_options = naga::back::glsl::Options {
                 version: naga::back::glsl::Version::Desktop(460),
                 writer_flags: naga::back::glsl::WriterFlags::empty(),
-                binding_map: Default::default(),
+                binding_map: glsl_binding_map.clone(),
                 zero_initialize_workgroup_memory: true,
             };
             let pipeline_options = naga::back::glsl::PipelineOptions {
@@ -316,6 +322,23 @@ fn build_msl_binding_map(
         map.insert(rb, target);
     }
 
+    map
+}
+
+/// Build a GLSL binding map from a parsed WGSL module.
+///
+/// Identity mapping: each WGSL `@group(G) @binding(B)` gets GL binding point B.
+/// This causes naga to emit `layout(binding = B)` qualifiers in GLSL, so the
+/// dispatch code can bind textures/images to matching units without name lookups.
+fn build_glsl_binding_map(
+    module: &naga::Module,
+) -> std::collections::BTreeMap<naga::ResourceBinding, u8> {
+    let mut map = std::collections::BTreeMap::new();
+    for (_, var) in module.global_variables.iter() {
+        if let Some(rb) = &var.binding {
+            map.insert(rb.clone(), rb.binding as u8);
+        }
+    }
     map
 }
 

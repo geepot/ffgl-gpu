@@ -626,6 +626,35 @@ mod gl_impl {
         }
     }
 
+    /// Bind textures for a compute dispatch.
+    ///
+    /// Each texture is bound to BOTH a GL texture unit (for `sampler2D`
+    /// uniforms) and a GL image unit (for `image2D` uniforms) at the same
+    /// index. Naga generates `layout(binding = N)` qualifiers that route
+    /// to the correct binding type based on the WGSL declaration.
+    unsafe fn bind_compute_textures(textures: &[&GpuTexture]) {
+        for (i, tex) in textures.iter().enumerate() {
+            let unit = i as u32;
+
+            // Bind as texture unit (for sampler2D / texelFetch)
+            gl::ActiveTexture(gl::TEXTURE0 + unit);
+            gl::BindTexture(gl::TEXTURE_2D, tex.gl_name);
+
+            // Also bind as image unit (for image2D / imageStore)
+            // READ_WRITE covers all access patterns; the shader's layout
+            // qualifier determines actual access.
+            gl::BindImageTexture(
+                unit,
+                tex.gl_name,
+                0,
+                gl::FALSE,
+                0,
+                gl::READ_WRITE,
+                tex.gl_format,
+            );
+        }
+    }
+
     impl GpuContext {
         /// Create a compute pipeline from a named entry point.
         ///
@@ -737,9 +766,11 @@ mod gl_impl {
 
         /// Dispatch a single compute pass and return a [`PendingWork`] token.
         ///
-        /// Textures are bound as image units starting at unit 0. Buffers are
-        /// bound as SSBOs at their specified binding indices. Bytes are set
-        /// via uniform buffer objects.
+        /// Textures are bound at their WGSL `@binding(N)` index to BOTH the
+        /// corresponding GL texture unit (for `sampler2D`) AND image unit
+        /// (for `image2D`). Naga's GLSL output uses `layout(binding = N)` to
+        /// route to the correct one. Buffers are bound as SSBOs. Bytes are
+        /// set via uniform buffer objects.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
@@ -752,26 +783,7 @@ mod gl_impl {
             unsafe {
                 gl::UseProgram(pipeline.program);
 
-                // Bind textures as image units
-                for (i, tex) in textures.iter().enumerate() {
-                    // Determine access mode from GLSL image qualifier:
-                    // Even indices = readonly (input), odd = writeonly (output).
-                    // This convention matches the WGSL binding order.
-                    let access = if i % 2 == 0 {
-                        gl::READ_ONLY
-                    } else {
-                        gl::WRITE_ONLY
-                    };
-                    gl::BindImageTexture(
-                        i as u32,
-                        tex.gl_name,
-                        0,
-                        gl::FALSE,
-                        0,
-                        access,
-                        tex.gl_format,
-                    );
-                }
+                bind_compute_textures(textures);
 
                 // Bind SSBOs
                 for (buf, idx) in buffers {
@@ -801,7 +813,9 @@ mod gl_impl {
 
                 // Memory barrier
                 gl::MemoryBarrier(
-                    gl::SHADER_IMAGE_ACCESS_BARRIER_BIT | gl::SHADER_STORAGE_BARRIER_BIT,
+                    gl::SHADER_IMAGE_ACCESS_BARRIER_BIT
+                        | gl::SHADER_STORAGE_BARRIER_BIT
+                        | gl::TEXTURE_FETCH_BARRIER_BIT,
                 );
 
                 // Cleanup temp UBOs
@@ -844,18 +858,12 @@ mod gl_impl {
                 gl::Viewport(0, 0, output.width as i32, output.height as i32);
                 gl::UseProgram(pipeline.program);
 
-                // Bind fragment textures as samplers
+                // Bind fragment textures to texture units.
+                // Naga generates `layout(binding = N)` qualifiers, so
+                // binding to texture unit N is automatic.
                 for (i, tex) in fragment_textures.iter().enumerate() {
                     gl::ActiveTexture(gl::TEXTURE0 + i as u32);
                     gl::BindTexture(gl::TEXTURE_2D, tex.gl_name);
-                    // Set sampler uniform to texture unit i
-                    let loc = gl::GetUniformLocation(
-                        pipeline.program,
-                        format!("_group_0_binding_{i}_fs\0").as_ptr() as *const _,
-                    );
-                    if loc >= 0 {
-                        gl::Uniform1i(loc, i as i32);
-                    }
                 }
 
                 // Bind uniform data
@@ -916,22 +924,7 @@ mod gl_impl {
             unsafe {
                 gl::UseProgram(pipeline.program);
 
-                for (i, tex) in textures.iter().enumerate() {
-                    let access = if i % 2 == 0 {
-                        gl::READ_ONLY
-                    } else {
-                        gl::WRITE_ONLY
-                    };
-                    gl::BindImageTexture(
-                        i as u32,
-                        tex.gl_name,
-                        0,
-                        gl::FALSE,
-                        0,
-                        access,
-                        tex.gl_format,
-                    );
-                }
+                bind_compute_textures(textures);
 
                 for (buf, idx) in buffers {
                     gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, *idx as u32, buf.gl_buffer);
