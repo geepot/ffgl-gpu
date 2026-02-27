@@ -8,6 +8,7 @@ members = [
     "examples/metal/invert",
     "examples/metal/blur",
     "examples/metal/kitchen-sink",
+    "examples/passthrough",
     "examples/dx11/passthrough",
     "examples/dx11/invert",
     "examples/dx11/blur",

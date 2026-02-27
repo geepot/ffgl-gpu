@@ -115,12 +115,30 @@ pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
         // --- macOS: Transpile to Metal, write .metal file ---
         #[cfg(target_os = "macos")]
         {
+            // Build binding map: auto-assign Metal indices per resource type.
+            // Textures get sequential [[texture(N)]], buffers get [[buffer(N)]],
+            // samplers get [[sampler(N)]].
+            let binding_map = build_msl_binding_map(&module);
+
+            let mut per_entry_point_map = std::collections::BTreeMap::new();
+            for entry in file_entries.iter() {
+                per_entry_point_map.insert(
+                    entry.entry_point.to_string(),
+                    naga::back::msl::EntryPointResources {
+                        resources: binding_map.clone(),
+                        push_constant_buffer: None,
+                        sizes_buffer: None,
+                    },
+                );
+            }
+
             let (msl_source, _) = naga::back::msl::write_string(
                 &module,
                 &info,
                 &naga::back::msl::Options {
                     lang_version: (2, 0),
-                    fake_missing_bindings: true,
+                    per_entry_point_map,
+                    fake_missing_bindings: false,
                     ..Default::default()
                 },
                 &naga::back::msl::PipelineOptions::default(),
@@ -184,8 +202,8 @@ pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
             }
         }
 
-        // Suppress unused variable warning on non-Windows
-        #[cfg(not(target_os = "windows"))]
+        // Suppress unused variable warning when neither Mac nor Windows
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = file_entries;
     }
 
@@ -244,6 +262,65 @@ pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
             }
         }
     }
+}
+
+/// Build a Metal binding map from a parsed WGSL module.
+///
+/// Inspects global variables for resource bindings and assigns sequential
+/// Metal indices per resource type: textures get `[[texture(N)]]`, buffers
+/// get `[[buffer(N)]]`, and samplers get `[[sampler(N)]]`.
+#[cfg(target_os = "macos")]
+fn build_msl_binding_map(
+    module: &naga::Module,
+) -> std::collections::BTreeMap<naga::ResourceBinding, naga::back::msl::BindTarget> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut texture_slot: u8 = 0;
+    let mut buffer_slot: u8 = 0;
+    let mut sampler_slot: u8 = 0;
+
+    // Collect and sort by (group, binding) for deterministic ordering
+    let mut bindings: Vec<_> = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, var)| {
+            let rb = var.binding.as_ref()?;
+            Some((rb.clone(), var.space, module.types[var.ty].inner.clone()))
+        })
+        .collect();
+    bindings.sort_by_key(|(rb, _, _)| (rb.group, rb.binding));
+
+    for (rb, _space, inner) in bindings {
+        let target = match inner {
+            naga::TypeInner::Image { .. } => {
+                let slot = texture_slot;
+                texture_slot += 1;
+                naga::back::msl::BindTarget {
+                    texture: Some(slot),
+                    ..Default::default()
+                }
+            }
+            naga::TypeInner::Sampler { .. } => {
+                let slot = sampler_slot;
+                sampler_slot += 1;
+                naga::back::msl::BindTarget {
+                    sampler: Some(naga::back::msl::BindSamplerTarget::Resource(slot)),
+                    ..Default::default()
+                }
+            }
+            _ => {
+                // Uniform/storage buffers and other resources
+                let slot = buffer_slot;
+                buffer_slot += 1;
+                naga::back::msl::BindTarget {
+                    buffer: Some(slot),
+                    ..Default::default()
+                }
+            }
+        };
+        map.insert(rb, target);
+    }
+
+    map
 }
 
 /// Compile Metal shaders from a directory.
