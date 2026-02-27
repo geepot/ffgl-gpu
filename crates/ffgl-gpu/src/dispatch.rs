@@ -42,6 +42,11 @@ pub struct CommandBuffer {
     #[cfg(target_os = "macos")]
     pub(crate) inner:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+
+    // On non-Mac, CommandBuffer is a thin marker. Compute/render passes
+    // dispatch immediately on encode; commit inserts a GL fence.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) _marker: (),
 }
 
 /// A token representing GPU work that has been submitted but may not yet be
@@ -50,7 +55,16 @@ pub struct PendingWork {
     #[cfg(target_os = "macos")]
     pub(crate) command_buffer:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fence: gl::types::GLsync,
 }
+
+// SAFETY: GL sync objects are thread-safe handles.
+#[cfg(not(target_os = "macos"))]
+unsafe impl Send for PendingWork {}
+#[cfg(not(target_os = "macos"))]
+unsafe impl Sync for PendingWork {}
 
 #[cfg(target_os = "macos")]
 impl PendingWork {
@@ -69,6 +83,25 @@ impl PendingWork {
     ) -> objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>
     {
         self.command_buffer
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl PendingWork {
+    /// Block until the GPU work completes.
+    pub fn wait(&self) {
+        unsafe {
+            gl::ClientWaitSync(self.fence, gl::SYNC_FLUSH_COMMANDS_BIT, u64::MAX);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for PendingWork {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteSync(self.fence);
+        }
     }
 }
 
