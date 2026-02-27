@@ -8,43 +8,26 @@ use anyhow::Result;
 use crate::buffer::GpuBuffer;
 use crate::context::GpuContext;
 use crate::pipeline::{ComputePipeline, RenderPipeline};
+use crate::texture::GpuTexture;
 
 // ---------------------------------------------------------------------------
-// Binding enum — platform-agnostic resource binding descriptor
-// ---------------------------------------------------------------------------
-
-/// A resource to bind at a numbered slot when dispatching a compute or render
-/// pipeline.
-pub enum Binding<'a> {
-    /// A GPU buffer.
-    Buffer(&'a GpuBuffer),
-    /// A platform-specific texture. On macOS this is a `&ProtocolObject<dyn
-    /// MTLTexture>`; on Windows an `&ID3D11ShaderResourceView` or
-    /// `&ID3D11UnorderedAccessView`. The caller must cast via `Any`.
-    Texture(&'a dyn std::any::Any),
-    /// Inline uniform / constant data (copied into the command encoder).
-    UniformData(&'a [u8]),
-}
-
-// ---------------------------------------------------------------------------
-// Compute pass — in-progress compute encoding
+// Command buffer + pending work types
 // ---------------------------------------------------------------------------
 
 /// A command buffer for encoding multiple passes.
 ///
-/// On macOS this wraps a `MTLCommandBuffer`. Create one with
-/// [`GpuContext::create_command_buffer`], encode compute and render passes
-/// on it, then call [`GpuContext::commit`] to submit all work at once.
+/// On macOS this wraps a `MTLCommandBuffer`. On other platforms it is a
+/// thin marker — dispatches execute immediately and [`GpuContext::commit`]
+/// inserts a GL fence.
 ///
-/// Metal automatically serialises encoders on the same command buffer, so
-/// there is no need for mid-frame `PendingWork::wait()` calls between passes.
+/// Create one with [`GpuContext::create_command_buffer`], encode compute and
+/// render passes on it, then call [`GpuContext::commit`] to submit all work
+/// at once.
 pub struct CommandBuffer {
     #[cfg(target_os = "macos")]
     pub(crate) inner:
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
 
-    // On non-Mac, CommandBuffer is a thin marker. Compute/render passes
-    // dispatch immediately on encode; commit inserts a GL fence.
     #[cfg(not(target_os = "macos"))]
     pub(crate) _marker: (),
 }
@@ -130,7 +113,7 @@ mod metal_impl {
     fn encode_compute_inner(
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         pipeline: &ComputePipeline,
-        textures: &[&ProtocolObject<dyn MTLTexture>],
+        textures: &[&GpuTexture],
         buffers: &[(&GpuBuffer, usize)],
         bytes: &[(&[u8], usize)],
         grid: (usize, usize),
@@ -140,7 +123,7 @@ mod metal_impl {
 
         for (i, tex) in textures.iter().enumerate() {
             unsafe {
-                encoder.setTexture_atIndex(Some(*tex), i);
+                encoder.setTexture_atIndex(Some(tex.metal_ref()), i);
             }
         }
 
@@ -172,6 +155,65 @@ mod metal_impl {
         };
         encoder.dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
         encoder.endEncoding();
+    }
+
+    /// Encode a fullscreen render pass onto `encoder`.
+    fn encode_render_inner(
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        pipeline: &RenderPipeline,
+        output: &GpuTexture,
+        fragment_textures: &[&GpuTexture],
+        fragment_bytes: &[(&[u8], usize)],
+    ) -> Result<()> {
+        let render_desc = MTLRenderPassDescriptor::new();
+        {
+            let attachment = unsafe {
+                render_desc
+                    .colorAttachments()
+                    .objectAtIndexedSubscript(0)
+            };
+            attachment.setTexture(Some(output.metal_ref()));
+            attachment.setLoadAction(MTLLoadAction::DontCare);
+            attachment.setStoreAction(MTLStoreAction::Store);
+        }
+
+        let encoder = cb
+            .renderCommandEncoderWithDescriptor(&render_desc)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create render encoder"))?;
+
+        encoder.setRenderPipelineState(&pipeline.state);
+
+        // Bind fullscreen quad vertex buffer at index 0
+        unsafe {
+            encoder.setVertexBuffer_offset_atIndex(Some(&pipeline.quad_vb), 0, 0);
+        }
+
+        // Bind fragment textures
+        for (i, tex) in fragment_textures.iter().enumerate() {
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(tex.metal_ref()), i);
+            }
+        }
+
+        // Bind fragment constant data
+        for (data, index) in fragment_bytes {
+            unsafe {
+                encoder.setFragmentBytes_length_atIndex(
+                    std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
+                    data.len(),
+                    *index,
+                );
+            }
+        }
+
+        // Draw fullscreen quad as triangle strip (4 vertices)
+        unsafe {
+            encoder
+                .drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+
+        encoder.endEncoding();
+        Ok(())
     }
 
     impl GpuContext {
@@ -265,9 +307,6 @@ mod metal_impl {
 
         /// Create a GPU buffer with the given number of elements and element
         /// size.
-        ///
-        /// The buffer is allocated with `StorageModePrivate` (GPU-only memory)
-        /// for optimal compute shader performance.
         pub fn create_buffer(
             &self,
             num_elements: usize,
@@ -289,8 +328,6 @@ mod metal_impl {
         }
 
         /// Create a GPU buffer with `StorageModeShared` (CPU + GPU accessible).
-        ///
-        /// Useful for constant/uniform buffers that need CPU writes.
         pub fn create_shared_buffer(
             &self,
             num_elements: usize,
@@ -311,16 +348,14 @@ mod metal_impl {
             })
         }
 
-        /// Dispatch a single compute pass: create a command buffer, encode
-        /// the pipeline with all bindings, dispatch, commit, and return a
-        /// [`PendingWork`] token.
+        /// Dispatch a single compute pass and return a [`PendingWork`] token.
         ///
         /// Textures are bound sequentially starting at index 0. Buffers and
         /// bytes are bound at their specified slot indices.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
-            textures: &[&ProtocolObject<dyn MTLTexture>],
+            textures: &[&GpuTexture],
             buffers: &[(&GpuBuffer, usize)],
             bytes: &[(&[u8], usize)],
             grid: (usize, usize),
@@ -344,16 +379,12 @@ mod metal_impl {
             Ok(PendingWork { command_buffer })
         }
 
-        /// Dispatch a fullscreen render pass: renders a quad using the given
-        /// render pipeline with the output texture as the render target and
-        /// input textures bound to fragment shader slots.
-        ///
-        /// Returns a [`PendingWork`] token for synchronization.
+        /// Dispatch a fullscreen render pass and return a [`PendingWork`] token.
         pub fn dispatch_render(
             &self,
             pipeline: &RenderPipeline,
-            output_texture: &ProtocolObject<dyn MTLTexture>,
-            fragment_textures: &[&ProtocolObject<dyn MTLTexture>],
+            output: &GpuTexture,
+            fragment_textures: &[&GpuTexture],
             fragment_bytes: &[(&[u8], usize)],
         ) -> Result<PendingWork> {
             let command_buffer = self
@@ -362,59 +393,16 @@ mod metal_impl {
                 .commandBuffer()
                 .ok_or_else(|| anyhow::anyhow!("Failed to create command buffer for render"))?;
 
-            let render_desc = MTLRenderPassDescriptor::new();
-            {
-                let attachment = unsafe {
-                    render_desc
-                        .colorAttachments()
-                        .objectAtIndexedSubscript(0)
-                };
-                attachment.setTexture(Some(output_texture));
-                attachment.setLoadAction(MTLLoadAction::DontCare);
-                attachment.setStoreAction(MTLStoreAction::Store);
-            }
+            encode_render_inner(
+                &command_buffer,
+                pipeline,
+                output,
+                fragment_textures,
+                fragment_bytes,
+            )?;
 
-            let encoder = command_buffer
-                .renderCommandEncoderWithDescriptor(&render_desc)
-                .ok_or_else(|| anyhow::anyhow!("Failed to create render encoder"))?;
-
-            encoder.setRenderPipelineState(&pipeline.state);
-
-            // Bind fullscreen quad vertex buffer at index 0
-            unsafe {
-                encoder.setVertexBuffer_offset_atIndex(Some(&pipeline.quad_vb), 0, 0);
-            }
-
-            // Bind fragment textures
-            for (i, tex) in fragment_textures.iter().enumerate() {
-                unsafe {
-                    encoder.setFragmentTexture_atIndex(Some(*tex), i);
-                }
-            }
-
-            // Bind fragment constant data
-            for (data, index) in fragment_bytes {
-                unsafe {
-                    encoder.setFragmentBytes_length_atIndex(
-                        std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
-                        data.len(),
-                        *index,
-                    );
-                }
-            }
-
-            // Draw fullscreen quad as triangle strip (4 vertices)
-            unsafe {
-                encoder
-                    .drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
-            }
-
-            encoder.endEncoding();
             command_buffer.commit();
-
-            Ok(PendingWork {
-                command_buffer,
-            })
+            Ok(PendingWork { command_buffer })
         }
 
         // =================================================================
@@ -422,11 +410,6 @@ mod metal_impl {
         // =================================================================
 
         /// Create a command buffer for encoding multiple passes.
-        ///
-        /// Use [`begin_compute_encoder`](Self::begin_compute_encoder),
-        /// [`encode_render_pass`](Self::encode_render_pass), and
-        /// [`commit`](Self::commit) to build and submit a multi-pass
-        /// pipeline in a single GPU submission with zero mid-frame stalls.
         pub fn create_command_buffer(&self) -> Result<CommandBuffer> {
             let inner = self
                 .device
@@ -437,18 +420,11 @@ mod metal_impl {
         }
 
         /// Encode a compute pass on an existing command buffer.
-        ///
-        /// Same encoding as [`dispatch_compute`](Self::dispatch_compute) but
-        /// targets the given [`CommandBuffer`] instead of creating a new one.
-        /// Call [`commit`](Self::commit) after encoding all passes.
-        ///
-        /// Textures are bound sequentially starting at index 0. Buffers and
-        /// bytes are bound at their specified slot indices.
         pub fn encode_compute_pass(
             &self,
             cb: &CommandBuffer,
             pipeline: &ComputePipeline,
-            textures: &[&ProtocolObject<dyn MTLTexture>],
+            textures: &[&GpuTexture],
             buffers: &[(&GpuBuffer, usize)],
             bytes: &[(&[u8], usize)],
             grid: (usize, usize),
@@ -467,79 +443,24 @@ mod metal_impl {
         }
 
         /// Encode a fullscreen render pass on an existing command buffer.
-        ///
-        /// Same rendering as [`dispatch_render`](Self::dispatch_render) but
-        /// encodes onto the given [`CommandBuffer`] instead of creating a
-        /// new one, avoiding an extra GPU submission boundary.
         pub fn encode_render_pass(
             &self,
             cb: &CommandBuffer,
             pipeline: &RenderPipeline,
-            output_texture: &ProtocolObject<dyn MTLTexture>,
-            fragment_textures: &[&ProtocolObject<dyn MTLTexture>],
+            output: &GpuTexture,
+            fragment_textures: &[&GpuTexture],
             fragment_bytes: &[(&[u8], usize)],
         ) -> Result<()> {
-            let render_desc = MTLRenderPassDescriptor::new();
-            {
-                let attachment = unsafe {
-                    render_desc
-                        .colorAttachments()
-                        .objectAtIndexedSubscript(0)
-                };
-                attachment.setTexture(Some(output_texture));
-                attachment.setLoadAction(MTLLoadAction::DontCare);
-                attachment.setStoreAction(MTLStoreAction::Store);
-            }
-
-            let encoder = cb
-                .inner
-                .renderCommandEncoderWithDescriptor(&render_desc)
-                .ok_or_else(|| anyhow::anyhow!("Failed to create render encoder"))?;
-
-            encoder.setRenderPipelineState(&pipeline.state);
-
-            // Bind fullscreen quad vertex buffer at index 0
-            unsafe {
-                encoder.setVertexBuffer_offset_atIndex(Some(&pipeline.quad_vb), 0, 0);
-            }
-
-            // Bind fragment textures
-            for (i, tex) in fragment_textures.iter().enumerate() {
-                unsafe {
-                    encoder.setFragmentTexture_atIndex(Some(*tex), i);
-                }
-            }
-
-            // Bind fragment constant data
-            for (data, index) in fragment_bytes {
-                unsafe {
-                    encoder.setFragmentBytes_length_atIndex(
-                        std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
-                        data.len(),
-                        *index,
-                    );
-                }
-            }
-
-            // Draw fullscreen quad as triangle strip (4 vertices)
-            unsafe {
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                );
-            }
-
-            encoder.endEncoding();
-            Ok(())
+            encode_render_inner(
+                &cb.inner,
+                pipeline,
+                output,
+                fragment_textures,
+                fragment_bytes,
+            )
         }
 
         /// Commit a command buffer and return a [`PendingWork`] token.
-        ///
-        /// Call this after encoding all passes. The returned token can be
-        /// stored via
-        /// [`GlMetalBridge::store_command_buffer`](gpu_interop::metal::GlMetalBridge::store_command_buffer)
-        /// for pipelined double-buffered synchronisation.
         pub fn commit(&self, cb: CommandBuffer) -> PendingWork {
             cb.inner.commit();
             PendingWork {
@@ -550,16 +471,13 @@ mod metal_impl {
 }
 
 // ---------------------------------------------------------------------------
-// Windows DX11 stub implementation
+// OpenGL 4.6 compute implementation (non-macOS)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "windows")]
-mod dx11_impl {
+#[cfg(not(target_os = "macos"))]
+mod gl_impl {
     use super::*;
-    use windows::core::PCSTR;
-    use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_BUFFER;
-    use windows::Win32::Graphics::Direct3D11::*;
-    use windows::Win32::Graphics::Dxgi::Common::*;
+    use std::ffi::CString;
 
     /// Fullscreen quad vertex data: 4 vertices, each with (x, y, u, v).
     /// Triangle-strip order: bottom-left, bottom-right, top-left, top-right.
@@ -570,371 +488,556 @@ mod dx11_impl {
         [1.0, 1.0, 1.0, 0.0],   // top-right
     ];
 
-    impl GpuContext {
-        /// Create a compute pipeline from pre-compiled HLSL bytecode (`.cso`).
-        pub fn create_compute_pipeline(
-            &self,
-            bytecode: &[u8],
-        ) -> Result<ComputePipeline> {
-            let mut shader = None;
-            unsafe {
-                self.device
-                    .device()
-                    .CreateComputeShader(bytecode, None, Some(&mut shader as *mut _))
+    /// Compile a GLSL shader source and return a linked program.
+    fn compile_shader_program(
+        shader_type: gl::types::GLenum,
+        source: &str,
+    ) -> Result<gl::types::GLuint> {
+        unsafe {
+            let shader = gl::CreateShader(shader_type);
+            if shader == 0 {
+                anyhow::bail!("glCreateShader returned 0");
             }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 compute shader: {e}"))?;
 
-            let shader =
-                shader.ok_or_else(|| anyhow::anyhow!("D3D11 CreateComputeShader returned null"))?;
+            let c_source = CString::new(source)
+                .map_err(|_| anyhow::anyhow!("Shader source contains null byte"))?;
+            let sources = [c_source.as_ptr()];
+            gl::ShaderSource(shader, 1, sources.as_ptr(), std::ptr::null());
+            gl::CompileShader(shader);
 
-            Ok(ComputePipeline { shader })
+            let mut success = 0i32;
+            gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut success);
+            if success == 0 {
+                let mut len = 0i32;
+                gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut len);
+                let mut log = vec![0u8; len as usize];
+                gl::GetShaderInfoLog(shader, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut _);
+                let msg = String::from_utf8_lossy(&log);
+                gl::DeleteShader(shader);
+                anyhow::bail!("Shader compilation failed: {msg}");
+            }
+
+            let program = gl::CreateProgram();
+            gl::AttachShader(program, shader);
+            gl::LinkProgram(program);
+
+            let mut link_success = 0i32;
+            gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_success);
+            if link_success == 0 {
+                let mut len = 0i32;
+                gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut len);
+                let mut log = vec![0u8; len as usize];
+                gl::GetProgramInfoLog(
+                    program,
+                    len,
+                    std::ptr::null_mut(),
+                    log.as_mut_ptr() as *mut _,
+                );
+                let msg = String::from_utf8_lossy(&log);
+                gl::DeleteShader(shader);
+                gl::DeleteProgram(program);
+                anyhow::bail!("Program link failed: {msg}");
+            }
+
+            gl::DeleteShader(shader);
+            Ok(program)
+        }
+    }
+
+    /// Compile a vertex + fragment shader pair and return a linked program.
+    fn compile_render_program(
+        vs_source: &str,
+        fs_source: &str,
+    ) -> Result<gl::types::GLuint> {
+        unsafe {
+            let vs = gl::CreateShader(gl::VERTEX_SHADER);
+            let fs = gl::CreateShader(gl::FRAGMENT_SHADER);
+            if vs == 0 || fs == 0 {
+                anyhow::bail!("glCreateShader returned 0");
+            }
+
+            // Compile vertex shader
+            let c_vs = CString::new(vs_source)
+                .map_err(|_| anyhow::anyhow!("VS source contains null byte"))?;
+            let vs_sources = [c_vs.as_ptr()];
+            gl::ShaderSource(vs, 1, vs_sources.as_ptr(), std::ptr::null());
+            gl::CompileShader(vs);
+
+            let mut success = 0i32;
+            gl::GetShaderiv(vs, gl::COMPILE_STATUS, &mut success);
+            if success == 0 {
+                let mut len = 0i32;
+                gl::GetShaderiv(vs, gl::INFO_LOG_LENGTH, &mut len);
+                let mut log = vec![0u8; len as usize];
+                gl::GetShaderInfoLog(vs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut _);
+                let msg = String::from_utf8_lossy(&log);
+                gl::DeleteShader(vs);
+                gl::DeleteShader(fs);
+                anyhow::bail!("Vertex shader compilation failed: {msg}");
+            }
+
+            // Compile fragment shader
+            let c_fs = CString::new(fs_source)
+                .map_err(|_| anyhow::anyhow!("FS source contains null byte"))?;
+            let fs_sources = [c_fs.as_ptr()];
+            gl::ShaderSource(fs, 1, fs_sources.as_ptr(), std::ptr::null());
+            gl::CompileShader(fs);
+
+            gl::GetShaderiv(fs, gl::COMPILE_STATUS, &mut success);
+            if success == 0 {
+                let mut len = 0i32;
+                gl::GetShaderiv(fs, gl::INFO_LOG_LENGTH, &mut len);
+                let mut log = vec![0u8; len as usize];
+                gl::GetShaderInfoLog(fs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut _);
+                let msg = String::from_utf8_lossy(&log);
+                gl::DeleteShader(vs);
+                gl::DeleteShader(fs);
+                anyhow::bail!("Fragment shader compilation failed: {msg}");
+            }
+
+            // Link program
+            let program = gl::CreateProgram();
+            gl::AttachShader(program, vs);
+            gl::AttachShader(program, fs);
+            gl::LinkProgram(program);
+
+            let mut link_success = 0i32;
+            gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_success);
+            if link_success == 0 {
+                let mut len = 0i32;
+                gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut len);
+                let mut log = vec![0u8; len as usize];
+                gl::GetProgramInfoLog(
+                    program,
+                    len,
+                    std::ptr::null_mut(),
+                    log.as_mut_ptr() as *mut _,
+                );
+                let msg = String::from_utf8_lossy(&log);
+                gl::DeleteShader(vs);
+                gl::DeleteShader(fs);
+                gl::DeleteProgram(program);
+                anyhow::bail!("Program link failed: {msg}");
+            }
+
+            gl::DeleteShader(vs);
+            gl::DeleteShader(fs);
+            Ok(program)
+        }
+    }
+
+    impl GpuContext {
+        /// Create a compute pipeline from a named entry point.
+        ///
+        /// Looks up the GLSL source by name from the shader sources provided
+        /// at construction time, compiles it with the GL driver, and returns
+        /// a linked compute program.
+        pub fn create_compute_pipeline(&self, name: &str) -> Result<ComputePipeline> {
+            let source = self
+                .shader_sources
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("GLSL shader source '{name}' not found"))?;
+
+            let program = compile_shader_program(gl::COMPUTE_SHADER, source)?;
+            Ok(ComputePipeline { program })
         }
 
-        /// Create a render pipeline from pre-compiled HLSL vertex and pixel
-        /// shader bytecode (`.cso`).
+        /// Create a render pipeline from vertex and fragment entry points.
         ///
-        /// Sets up a fullscreen quad vertex buffer with `POSITION float2 +
-        /// TEXCOORD float2` layout and a linear/clamp sampler for pixel shader
-        /// texture sampling.
+        /// Looks up the GLSL sources by name and compiles a linked VS+FS
+        /// program. Also creates a fullscreen quad VAO/VBO.
         pub fn create_render_pipeline(
             &self,
-            vs_bytecode: &[u8],
-            ps_bytecode: &[u8],
+            vertex_name: &str,
+            fragment_name: &str,
         ) -> Result<RenderPipeline> {
-            let device = self.device.device();
+            let vs_source = self
+                .shader_sources
+                .get(vertex_name)
+                .ok_or_else(|| anyhow::anyhow!("GLSL vertex shader '{vertex_name}' not found"))?;
+            let fs_source = self.shader_sources.get(fragment_name).ok_or_else(|| {
+                anyhow::anyhow!("GLSL fragment shader '{fragment_name}' not found")
+            })?;
 
-            // Create vertex shader
-            let mut vs = None;
-            unsafe { device.CreateVertexShader(vs_bytecode, None, Some(&mut vs as *mut _)) }
-                .map_err(|e| anyhow::anyhow!("Failed to create D3D11 vertex shader: {e}"))?;
-            let vs = vs.ok_or_else(|| anyhow::anyhow!("D3D11 CreateVertexShader returned null"))?;
+            let program = compile_render_program(vs_source, fs_source)?;
 
-            // Create pixel shader
-            let mut ps = None;
-            unsafe { device.CreatePixelShader(ps_bytecode, None, Some(&mut ps as *mut _)) }
-                .map_err(|e| anyhow::anyhow!("Failed to create D3D11 pixel shader: {e}"))?;
-            let ps = ps.ok_or_else(|| anyhow::anyhow!("D3D11 CreatePixelShader returned null"))?;
-
-            // Create input layout: POSITION float2 + TEXCOORD float2
-            let input_elements = [
-                D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: PCSTR(b"POSITION\0".as_ptr()),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: 0,
-                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-                D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: PCSTR(b"TEXCOORD\0".as_ptr()),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: 8,
-                    InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-            ];
-
-            let mut input_layout = None;
+            // Create fullscreen quad VAO + VBO
+            let (mut vao, mut vbo) = (0u32, 0u32);
             unsafe {
-                device.CreateInputLayout(
-                    &input_elements,
-                    vs_bytecode,
-                    Some(&mut input_layout as *mut _),
-                )
-            }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 input layout: {e}"))?;
-            let input_layout = input_layout
-                .ok_or_else(|| anyhow::anyhow!("D3D11 CreateInputLayout returned null"))?;
+                gl::GenVertexArrays(1, &mut vao);
+                gl::GenBuffers(1, &mut vbo);
 
-            // Create fullscreen quad vertex buffer
-            let quad_data = FULLSCREEN_QUAD;
-            let vb_desc = D3D11_BUFFER_DESC {
-                ByteWidth: std::mem::size_of_val(&quad_data) as u32,
-                Usage: D3D11_USAGE_IMMUTABLE,
-                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                ..Default::default()
-            };
-            let vb_init = D3D11_SUBRESOURCE_DATA {
-                pSysMem: quad_data.as_ptr() as *const _,
-                ..Default::default()
-            };
-            let mut quad_vb = None;
-            unsafe {
-                device.CreateBuffer(&vb_desc, Some(&vb_init), Some(&mut quad_vb as *mut _))
-            }
-            .map_err(|e| anyhow::anyhow!("Failed to create fullscreen quad VB: {e}"))?;
-            let quad_vb =
-                quad_vb.ok_or_else(|| anyhow::anyhow!("D3D11 CreateBuffer(VB) returned null"))?;
+                gl::BindVertexArray(vao);
+                gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+                gl::BufferData(
+                    gl::ARRAY_BUFFER,
+                    std::mem::size_of_val(&FULLSCREEN_QUAD) as isize,
+                    FULLSCREEN_QUAD.as_ptr() as *const _,
+                    gl::STATIC_DRAW,
+                );
 
-            // Create linear/clamp sampler
-            let sampler_desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D11_COMPARISON_NEVER,
-                MinLOD: 0.0,
-                MaxLOD: f32::MAX,
-                ..Default::default()
-            };
-            let mut sampler = None;
-            unsafe {
-                device.CreateSamplerState(&sampler_desc, Some(&mut sampler as *mut _))
+                // position: location 0, vec2 at offset 0
+                gl::EnableVertexAttribArray(0);
+                gl::VertexAttribPointer(
+                    0,
+                    2,
+                    gl::FLOAT,
+                    gl::FALSE,
+                    (4 * std::mem::size_of::<f32>()) as i32,
+                    std::ptr::null(),
+                );
+
+                // texcoord: location 1, vec2 at offset 8
+                gl::EnableVertexAttribArray(1);
+                gl::VertexAttribPointer(
+                    1,
+                    2,
+                    gl::FLOAT,
+                    gl::FALSE,
+                    (4 * std::mem::size_of::<f32>()) as i32,
+                    (2 * std::mem::size_of::<f32>()) as *const _,
+                );
+
+                gl::BindVertexArray(0);
+                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
             }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 sampler: {e}"))?;
-            let sampler =
-                sampler.ok_or_else(|| anyhow::anyhow!("D3D11 CreateSamplerState returned null"))?;
 
             Ok(RenderPipeline {
-                vs,
-                ps,
-                input_layout,
-                quad_vb,
-                sampler,
+                program,
+                quad_vao: vao,
+                quad_vb: vbo,
             })
         }
 
-        /// Create a GPU buffer as a structured buffer with UAV + SRV views.
+        /// Create a GPU buffer (SSBO) with the given number of elements and
+        /// element size.
         pub fn create_buffer(
             &self,
             num_elements: usize,
             element_size: usize,
         ) -> Result<GpuBuffer> {
             let size = num_elements * element_size;
-
-            let buffer_desc = D3D11_BUFFER_DESC {
-                ByteWidth: size as u32,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
-                StructureByteStride: element_size as u32,
-                ..Default::default()
-            };
-
-            let mut buffer = None;
+            let mut buf = 0u32;
             unsafe {
-                self.device.device().CreateBuffer(
-                    &buffer_desc,
-                    None,
-                    Some(&mut buffer as *mut _),
-                )
+                gl::GenBuffers(1, &mut buf);
+                gl::BindBuffer(gl::SHADER_STORAGE_BUFFER, buf);
+                gl::BufferData(
+                    gl::SHADER_STORAGE_BUFFER,
+                    size as isize,
+                    std::ptr::null(),
+                    gl::DYNAMIC_DRAW,
+                );
+                gl::BindBuffer(gl::SHADER_STORAGE_BUFFER, 0);
             }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 structured buffer: {e}"))?;
-            let buffer =
-                buffer.ok_or_else(|| anyhow::anyhow!("D3D11 CreateBuffer returned null"))?;
-
-            // Create UAV
-            let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
-                Format: DXGI_FORMAT_UNKNOWN,
-                ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
-                Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
-                    Buffer: D3D11_BUFFER_UAV {
-                        FirstElement: 0,
-                        NumElements: num_elements as u32,
-                        Flags: 0,
-                    },
-                },
-            };
-
-            let mut uav = None;
-            unsafe {
-                self.device.device().CreateUnorderedAccessView(
-                    &buffer,
-                    Some(&uav_desc),
-                    Some(&mut uav as *mut _),
-                )
-            }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 UAV: {e}"))?;
-            let uav = uav.ok_or_else(|| anyhow::anyhow!("D3D11 CreateUAV returned null"))?;
-
-            // Create SRV
-            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_UNKNOWN,
-                ViewDimension: D3D_SRV_DIMENSION_BUFFER,
-                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Buffer: D3D11_BUFFER_SRV {
-                        Anonymous1: D3D11_BUFFER_SRV_0 {
-                            FirstElement: 0,
-                        },
-                        Anonymous2: D3D11_BUFFER_SRV_1 {
-                            NumElements: num_elements as u32,
-                        },
-                    },
-                },
-            };
-
-            let mut srv = None;
-            unsafe {
-                self.device.device().CreateShaderResourceView(
-                    &buffer,
-                    Some(&srv_desc),
-                    Some(&mut srv as *mut _),
-                )
-            }
-            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 SRV: {e}"))?;
-            let srv = srv.ok_or_else(|| anyhow::anyhow!("D3D11 CreateSRV returned null"))?;
-
             Ok(GpuBuffer {
                 size,
-                dx11_buffer: buffer,
-                dx11_uav: uav,
-                dx11_srv: srv,
+                gl_buffer: buf,
             })
         }
 
-        /// Dispatch a compute shader on the immediate context.
+        /// Dispatch a single compute pass and return a [`PendingWork`] token.
         ///
-        /// Binds the compute shader, UAVs, SRVs, and constant buffers, then
-        /// dispatches enough thread groups to cover `grid` total threads with
-        /// the given `threadgroup` size. Unbinds all CS resources after dispatch
-        /// to prevent resource hazards in multi-pass scenarios.
+        /// Textures are bound as image units starting at unit 0. Buffers are
+        /// bound as SSBOs at their specified binding indices. Bytes are set
+        /// via uniform buffer objects.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
-            uavs: &[Option<ID3D11UnorderedAccessView>],
-            srvs: &[Option<ID3D11ShaderResourceView>],
-            cbufs: &[Option<ID3D11Buffer>],
+            textures: &[&GpuTexture],
+            buffers: &[(&GpuBuffer, usize)],
+            bytes: &[(&[u8], usize)],
             grid: (usize, usize),
             threadgroup: (usize, usize),
-        ) {
-            let groups_x = ((grid.0 + threadgroup.0 - 1) / threadgroup.0) as u32;
-            let groups_y = ((grid.1 + threadgroup.1 - 1) / threadgroup.1) as u32;
-
-            let ctx = self.device.context();
+        ) -> Result<PendingWork> {
             unsafe {
-                ctx.CSSetShader(&pipeline.shader, None);
-                if !uavs.is_empty() {
-                    ctx.CSSetUnorderedAccessViews(0, uavs, None);
-                }
-                if !srvs.is_empty() {
-                    ctx.CSSetShaderResources(0, srvs);
-                }
-                if !cbufs.is_empty() {
-                    ctx.CSSetConstantBuffers(0, cbufs);
-                }
-                ctx.Dispatch(groups_x, groups_y, 1);
+                gl::UseProgram(pipeline.program);
 
-                // Unbind all CS resources to prevent hazards when the same
-                // texture is used as SRV in a subsequent pass.
-                let null_uavs: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
-                let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
-                let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
-                ctx.CSSetUnorderedAccessViews(0, &null_uavs, None);
-                ctx.CSSetShaderResources(0, &null_srvs);
-                ctx.CSSetConstantBuffers(0, &null_cbufs);
+                // Bind textures as image units
+                for (i, tex) in textures.iter().enumerate() {
+                    // Determine access mode from GLSL image qualifier:
+                    // Even indices = readonly (input), odd = writeonly (output).
+                    // This convention matches the WGSL binding order.
+                    let access = if i % 2 == 0 {
+                        gl::READ_ONLY
+                    } else {
+                        gl::WRITE_ONLY
+                    };
+                    gl::BindImageTexture(
+                        i as u32,
+                        tex.gl_name,
+                        0,
+                        gl::FALSE,
+                        0,
+                        access,
+                        tex.gl_format,
+                    );
+                }
+
+                // Bind SSBOs
+                for (buf, idx) in buffers {
+                    gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, *idx as u32, buf.gl_buffer);
+                }
+
+                // Bind inline uniform data via temporary UBOs
+                let mut temp_ubos = Vec::new();
+                for (data, idx) in bytes {
+                    let mut ubo = 0u32;
+                    gl::GenBuffers(1, &mut ubo);
+                    gl::BindBuffer(gl::UNIFORM_BUFFER, ubo);
+                    gl::BufferData(
+                        gl::UNIFORM_BUFFER,
+                        data.len() as isize,
+                        data.as_ptr() as *const _,
+                        gl::STREAM_DRAW,
+                    );
+                    gl::BindBufferBase(gl::UNIFORM_BUFFER, *idx as u32, ubo);
+                    temp_ubos.push(ubo);
+                }
+
+                // Dispatch
+                let gx = ((grid.0 + threadgroup.0 - 1) / threadgroup.0) as u32;
+                let gy = ((grid.1 + threadgroup.1 - 1) / threadgroup.1) as u32;
+                gl::DispatchCompute(gx, gy, 1);
+
+                // Memory barrier
+                gl::MemoryBarrier(
+                    gl::SHADER_IMAGE_ACCESS_BARRIER_BIT | gl::SHADER_STORAGE_BARRIER_BIT,
+                );
+
+                // Cleanup temp UBOs
+                if !temp_ubos.is_empty() {
+                    gl::DeleteBuffers(temp_ubos.len() as i32, temp_ubos.as_ptr());
+                }
+
+                gl::UseProgram(0);
+
+                // Insert fence for synchronisation
+                let fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+                Ok(PendingWork { fence })
             }
         }
 
-        /// Dispatch a fullscreen render pass using the given render pipeline.
+        /// Dispatch a fullscreen render pass and return a [`PendingWork`] token.
         ///
-        /// Creates a temporary render target view from `output_texture`, sets
-        /// up the viewport, draws a fullscreen quad, and unbinds all resources
-        /// afterward to prevent hazards.
+        /// Creates a temporary FBO, attaches the output texture, and draws
+        /// a fullscreen quad with the given render pipeline.
         pub fn dispatch_render(
             &self,
             pipeline: &RenderPipeline,
-            output_texture: &ID3D11Texture2D,
-            pixel_srvs: &[Option<ID3D11ShaderResourceView>],
-            pixel_cbufs: &[Option<ID3D11Buffer>],
-        ) -> Result<()> {
-            let device = self.device.device();
-            let ctx = self.device.context();
-
-            // Query texture dimensions for viewport
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { output_texture.GetDesc(&mut desc) };
-
-            // Create temporary RTV
-            let mut rtv = None;
+            output: &GpuTexture,
+            fragment_textures: &[&GpuTexture],
+            fragment_bytes: &[(&[u8], usize)],
+        ) -> Result<PendingWork> {
             unsafe {
-                device.CreateRenderTargetView(output_texture, None, Some(&mut rtv as *mut _))
-            }
-            .map_err(|e| anyhow::anyhow!("Failed to create RTV for render dispatch: {e}"))?;
-            let rtv = rtv.ok_or_else(|| anyhow::anyhow!("D3D11 CreateRTV returned null"))?;
-
-            unsafe {
-                // Set viewport
-                let viewport = D3D11_VIEWPORT {
-                    TopLeftX: 0.0,
-                    TopLeftY: 0.0,
-                    Width: desc.Width as f32,
-                    Height: desc.Height as f32,
-                    MinDepth: 0.0,
-                    MaxDepth: 1.0,
-                };
-                ctx.RSSetViewports(Some(&[viewport]));
-
-                // Input assembler
-                ctx.IASetInputLayout(&pipeline.input_layout);
-                let stride = std::mem::size_of::<[f32; 4]>() as u32;
-                let offset = 0u32;
-                ctx.IASetVertexBuffers(
+                // Create and bind temporary FBO
+                let mut fbo = 0u32;
+                gl::GenFramebuffers(1, &mut fbo);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+                gl::FramebufferTexture2D(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::TEXTURE_2D,
+                    output.gl_name,
                     0,
-                    1,
-                    Some(&Some(pipeline.quad_vb.clone())),
-                    Some(&stride),
-                    Some(&offset),
-                );
-                ctx.IASetPrimitiveTopology(
-                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
                 );
 
-                // Vertex shader
-                ctx.VSSetShader(&pipeline.vs, None);
+                gl::Viewport(0, 0, output.width as i32, output.height as i32);
+                gl::UseProgram(pipeline.program);
 
-                // Pixel shader
-                ctx.PSSetShader(&pipeline.ps, None);
-                if !pixel_srvs.is_empty() {
-                    ctx.PSSetShaderResources(0, pixel_srvs);
+                // Bind fragment textures as samplers
+                for (i, tex) in fragment_textures.iter().enumerate() {
+                    gl::ActiveTexture(gl::TEXTURE0 + i as u32);
+                    gl::BindTexture(gl::TEXTURE_2D, tex.gl_name);
+                    // Set sampler uniform to texture unit i
+                    let loc = gl::GetUniformLocation(
+                        pipeline.program,
+                        format!("_group_0_binding_{i}_fs\0").as_ptr() as *const _,
+                    );
+                    if loc >= 0 {
+                        gl::Uniform1i(loc, i as i32);
+                    }
                 }
-                if !pixel_cbufs.is_empty() {
-                    ctx.PSSetConstantBuffers(0, pixel_cbufs);
-                }
-                ctx.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
 
-                // Output merger
-                ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+                // Bind uniform data
+                let mut temp_ubos = Vec::new();
+                for (data, idx) in fragment_bytes {
+                    let mut ubo = 0u32;
+                    gl::GenBuffers(1, &mut ubo);
+                    gl::BindBuffer(gl::UNIFORM_BUFFER, ubo);
+                    gl::BufferData(
+                        gl::UNIFORM_BUFFER,
+                        data.len() as isize,
+                        data.as_ptr() as *const _,
+                        gl::STREAM_DRAW,
+                    );
+                    gl::BindBufferBase(gl::UNIFORM_BUFFER, *idx as u32, ubo);
+                    temp_ubos.push(ubo);
+                }
 
                 // Draw fullscreen quad
-                ctx.Draw(4, 0);
+                gl::BindVertexArray(pipeline.quad_vao);
+                gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+                gl::BindVertexArray(0);
 
-                // Unbind render target and PS SRVs to prevent resource hazards
-                let null_rtvs: [Option<ID3D11RenderTargetView>; 1] = Default::default();
-                ctx.OMSetRenderTargets(Some(&null_rtvs), None);
-                let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
-                ctx.PSSetShaderResources(0, &null_srvs);
-                let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
-                ctx.PSSetConstantBuffers(0, &null_cbufs);
+                // Cleanup
+                gl::UseProgram(0);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::DeleteFramebuffers(1, &fbo);
+                if !temp_ubos.is_empty() {
+                    gl::DeleteBuffers(temp_ubos.len() as i32, temp_ubos.as_ptr());
+                }
+
+                // Insert fence
+                let fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+                Ok(PendingWork { fence })
             }
+        }
 
+        // =================================================================
+        // Multi-pass command buffer API
+        // =================================================================
+
+        /// Create a command buffer (thin marker on GL).
+        pub fn create_command_buffer(&self) -> Result<CommandBuffer> {
+            Ok(CommandBuffer { _marker: () })
+        }
+
+        /// Encode a compute pass (dispatches immediately on GL).
+        pub fn encode_compute_pass(
+            &self,
+            _cb: &CommandBuffer,
+            pipeline: &ComputePipeline,
+            textures: &[&GpuTexture],
+            buffers: &[(&GpuBuffer, usize)],
+            bytes: &[(&[u8], usize)],
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) -> Result<()> {
+            unsafe {
+                gl::UseProgram(pipeline.program);
+
+                for (i, tex) in textures.iter().enumerate() {
+                    let access = if i % 2 == 0 {
+                        gl::READ_ONLY
+                    } else {
+                        gl::WRITE_ONLY
+                    };
+                    gl::BindImageTexture(
+                        i as u32,
+                        tex.gl_name,
+                        0,
+                        gl::FALSE,
+                        0,
+                        access,
+                        tex.gl_format,
+                    );
+                }
+
+                for (buf, idx) in buffers {
+                    gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, *idx as u32, buf.gl_buffer);
+                }
+
+                let mut temp_ubos = Vec::new();
+                for (data, idx) in bytes {
+                    let mut ubo = 0u32;
+                    gl::GenBuffers(1, &mut ubo);
+                    gl::BindBuffer(gl::UNIFORM_BUFFER, ubo);
+                    gl::BufferData(
+                        gl::UNIFORM_BUFFER,
+                        data.len() as isize,
+                        data.as_ptr() as *const _,
+                        gl::STREAM_DRAW,
+                    );
+                    gl::BindBufferBase(gl::UNIFORM_BUFFER, *idx as u32, ubo);
+                    temp_ubos.push(ubo);
+                }
+
+                let gx = ((grid.0 + threadgroup.0 - 1) / threadgroup.0) as u32;
+                let gy = ((grid.1 + threadgroup.1 - 1) / threadgroup.1) as u32;
+                gl::DispatchCompute(gx, gy, 1);
+                gl::MemoryBarrier(
+                    gl::SHADER_IMAGE_ACCESS_BARRIER_BIT | gl::SHADER_STORAGE_BARRIER_BIT,
+                );
+
+                if !temp_ubos.is_empty() {
+                    gl::DeleteBuffers(temp_ubos.len() as i32, temp_ubos.as_ptr());
+                }
+
+                gl::UseProgram(0);
+            }
             Ok(())
         }
 
-        /// Map a dynamic constant buffer, copy data into it, and unmap.
-        ///
-        /// The buffer must have been created with `D3D11_USAGE_DYNAMIC` and
-        /// `D3D11_CPU_ACCESS_WRITE` (e.g. via
-        /// [`create_dynamic_cbuf`](gpu_interop::dx11::create_dynamic_cbuf)).
-        pub fn update_constant_buffer(&self, buffer: &ID3D11Buffer, data: &[u8]) {
-            let ctx = self.device.context();
+        /// Encode a fullscreen render pass (draws immediately on GL).
+        pub fn encode_render_pass(
+            &self,
+            _cb: &CommandBuffer,
+            pipeline: &RenderPipeline,
+            output: &GpuTexture,
+            fragment_textures: &[&GpuTexture],
+            fragment_bytes: &[(&[u8], usize)],
+        ) -> Result<()> {
             unsafe {
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                let hr = ctx.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped));
-                if hr.is_ok() {
-                    debug_assert!(
-                        data.len() <= mapped.RowPitch as usize,
-                        "update_constant_buffer: data ({} bytes) exceeds mapped region ({} bytes)",
-                        data.len(),
-                        mapped.RowPitch,
+                let mut fbo = 0u32;
+                gl::GenFramebuffers(1, &mut fbo);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+                gl::FramebufferTexture2D(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::TEXTURE_2D,
+                    output.gl_name,
+                    0,
+                );
+
+                gl::Viewport(0, 0, output.width as i32, output.height as i32);
+                gl::UseProgram(pipeline.program);
+
+                for (i, tex) in fragment_textures.iter().enumerate() {
+                    gl::ActiveTexture(gl::TEXTURE0 + i as u32);
+                    gl::BindTexture(gl::TEXTURE_2D, tex.gl_name);
+                    let loc = gl::GetUniformLocation(
+                        pipeline.program,
+                        format!("_group_0_binding_{i}_fs\0").as_ptr() as *const _,
                     );
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.pData as *mut u8, data.len());
-                    ctx.Unmap(buffer, 0);
+                    if loc >= 0 {
+                        gl::Uniform1i(loc, i as i32);
+                    }
+                }
+
+                let mut temp_ubos = Vec::new();
+                for (data, idx) in fragment_bytes {
+                    let mut ubo = 0u32;
+                    gl::GenBuffers(1, &mut ubo);
+                    gl::BindBuffer(gl::UNIFORM_BUFFER, ubo);
+                    gl::BufferData(
+                        gl::UNIFORM_BUFFER,
+                        data.len() as isize,
+                        data.as_ptr() as *const _,
+                        gl::STREAM_DRAW,
+                    );
+                    gl::BindBufferBase(gl::UNIFORM_BUFFER, *idx as u32, ubo);
+                    temp_ubos.push(ubo);
+                }
+
+                gl::BindVertexArray(pipeline.quad_vao);
+                gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+                gl::BindVertexArray(0);
+
+                gl::UseProgram(0);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::DeleteFramebuffers(1, &fbo);
+                if !temp_ubos.is_empty() {
+                    gl::DeleteBuffers(temp_ubos.len() as i32, temp_ubos.as_ptr());
                 }
             }
+            Ok(())
+        }
+
+        /// Commit a command buffer — inserts a GL fence and returns a
+        /// [`PendingWork`] token.
+        pub fn commit(&self, _cb: CommandBuffer) -> PendingWork {
+            let fence = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
+            PendingWork { fence }
         }
     }
 }

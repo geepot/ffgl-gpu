@@ -37,7 +37,7 @@ pub mod texture;
 pub use buffer::GpuBuffer;
 pub use bytes::AsBytes;
 pub use context::GpuContext;
-pub use dispatch::{Binding, CommandBuffer, PendingWork};
+pub use dispatch::{CommandBuffer, PendingWork};
 pub use drawing::{draw_gpu_effect, ensure_instance_gl_resources, validate_gl_state_before_draw};
 pub use pipeline::{ComputePipeline, RenderPipeline};
 pub use plugin::{DrawInput, GpuPlugin};
