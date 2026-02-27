@@ -1,43 +1,250 @@
 //! Shader compilation helpers for consumer `build.rs` scripts.
 //!
-//! These functions compile Metal (`.metal` -> `.metallib`) and HLSL
-//! (`.hlsl` -> `.cso`) shaders at build time and emit the appropriate
+//! These functions compile shaders at build time and emit the appropriate
 //! `cargo:rerun-if-changed` directives.
 //!
 //! # Usage
 //!
-//! In your plugin crate's `build.rs`:
+//! Write shaders in WGSL and use [`compile_wgsl_shaders`] in your `build.rs`:
 //!
 //! ```rust,ignore
-//! // macOS
-//! ffgl_gpu::build_support::compile_metal_shaders(
-//!     std::path::Path::new("src/shaders"),
-//! );
+//! use ffgl_gpu::build_support::{compile_wgsl_shaders, WgslEntry, ShaderStage};
 //!
-//! // Windows
-//! ffgl_gpu::build_support::compile_hlsl_shaders(
-//!     std::path::Path::new("src/shaders"),
-//!     &[
-//!         ffgl_gpu::build_support::HlslEntry {
-//!             file: "compute.hlsl",
-//!             entry_point: "main_cs",
-//!             target: "cs_5_0",
-//!         },
-//!     ],
-//! );
+//! fn main() {
+//!     compile_wgsl_shaders(
+//!         std::path::Path::new("shaders"),
+//!         &[WgslEntry {
+//!             file: "passthrough.wgsl",
+//!             entry_point: "passthrough",
+//!             stage: ShaderStage::Compute,
+//!         }],
+//!     );
+//! }
 //! ```
 //!
 //! Then in your Rust source, load the compiled shaders:
 //!
 //! ```rust,ignore
-//! // Metal
+//! // macOS: embedded metallib
 //! let metallib = ffgl_gpu::include_metallib!();
 //!
-//! // HLSL
-//! let compute_shader = ffgl_gpu::include_hlsl_shader!("compute");
+//! // Windows: embedded GLSL source
+//! let glsl = ffgl_gpu::include_glsl_shader!("passthrough");
 //! ```
 
 use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// WGSL transpilation (cross-platform)
+// ---------------------------------------------------------------------------
+
+/// Shader stage for WGSL entry points.
+#[derive(Debug, Clone, Copy)]
+pub enum ShaderStage {
+    Compute,
+    Vertex,
+    Fragment,
+}
+
+impl ShaderStage {
+    fn to_naga(self) -> naga::ShaderStage {
+        match self {
+            ShaderStage::Compute => naga::ShaderStage::Compute,
+            ShaderStage::Vertex => naga::ShaderStage::Vertex,
+            ShaderStage::Fragment => naga::ShaderStage::Fragment,
+        }
+    }
+}
+
+/// A WGSL shader entry point to compile.
+pub struct WgslEntry {
+    /// WGSL source file name (relative to the shader directory).
+    pub file: &'static str,
+    /// Entry point function name in the WGSL source.
+    pub entry_point: &'static str,
+    /// Shader stage.
+    pub stage: ShaderStage,
+}
+
+/// Compile WGSL shaders via naga transpilation.
+///
+/// Parses each WGSL source file, validates it, then:
+/// - **macOS:** Transpiles to Metal Shading Language, compiles `.metal` → `.air`
+///   → `.metallib` via `xcrun`.
+/// - **Windows:** Transpiles to GLSL 4.60, writes `<entry_point>.glsl` to
+///   `OUT_DIR`.
+///
+/// Emits `cargo:rerun-if-changed` for each `.wgsl` file.
+pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+
+    // Group entries by source file to avoid re-parsing
+    let mut files_to_entries: std::collections::BTreeMap<&str, Vec<&WgslEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        files_to_entries
+            .entry(entry.file)
+            .or_default()
+            .push(entry);
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut metal_files: Vec<std::path::PathBuf> = Vec::new();
+
+    for (file, file_entries) in &files_to_entries {
+        let wgsl_path = shader_dir.join(file);
+        let source = std::fs::read_to_string(&wgsl_path).unwrap_or_else(|e| {
+            panic!("Failed to read WGSL source {wgsl_path:?}: {e}");
+        });
+
+        // Parse WGSL
+        let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| {
+            panic!("Failed to parse WGSL {wgsl_path:?}: {e}");
+        });
+
+        // Validate
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| {
+            panic!("WGSL validation failed for {wgsl_path:?}: {e}");
+        });
+
+        // --- macOS: Transpile to Metal, write .metal file ---
+        #[cfg(target_os = "macos")]
+        {
+            let (msl_source, _) = naga::back::msl::write_string(
+                &module,
+                &info,
+                &naga::back::msl::Options {
+                    lang_version: (2, 0),
+                    fake_missing_bindings: true,
+                    ..Default::default()
+                },
+                &naga::back::msl::PipelineOptions::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("MSL transpilation failed for {wgsl_path:?}: {e}");
+            });
+
+            let stem = std::path::Path::new(file)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let metal_path = format!("{out_dir}/{stem}.metal");
+            std::fs::write(&metal_path, &msl_source).unwrap_or_else(|e| {
+                panic!("Failed to write {metal_path}: {e}");
+            });
+            metal_files.push(std::path::PathBuf::from(metal_path));
+        }
+
+        // --- Windows: Transpile each entry point to GLSL 4.60 ---
+        #[cfg(target_os = "windows")]
+        {
+            for entry in file_entries {
+                let mut glsl_source = String::new();
+                let mut writer = naga::back::glsl::Writer::new(
+                    &mut glsl_source,
+                    &module,
+                    &info,
+                    &naga::back::glsl::Options {
+                        version: naga::back::glsl::Version::Desktop(460),
+                        writer_flags: naga::back::glsl::WriterFlags::empty(),
+                        binding_map: Default::default(),
+                        zero_initialize_workgroup_memory: true,
+                    },
+                    &naga::back::glsl::PipelineOptions {
+                        shader_stage: entry.stage.to_naga(),
+                        entry_point: entry.entry_point.to_string(),
+                        multiview: None,
+                    },
+                    naga::proc::BoundsCheckPolicies::default(),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "GLSL writer init failed for {}:{}: {e}",
+                        file, entry.entry_point
+                    );
+                });
+
+                writer.write().unwrap_or_else(|e| {
+                    panic!(
+                        "GLSL transpilation failed for {}:{}: {e}",
+                        file, entry.entry_point
+                    );
+                });
+
+                let glsl_path = format!("{out_dir}/{}.glsl", entry.entry_point);
+                std::fs::write(&glsl_path, &glsl_source).unwrap_or_else(|e| {
+                    panic!("Failed to write {glsl_path}: {e}");
+                });
+            }
+        }
+
+        // Suppress unused variable warning on non-Windows
+        #[cfg(not(target_os = "windows"))]
+        let _ = file_entries;
+    }
+
+    // --- macOS: Compile .metal → .air → .metallib ---
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        if metal_files.is_empty() {
+            return;
+        }
+
+        let mut air_files = Vec::new();
+        for metal_file in &metal_files {
+            let stem = metal_file.file_stem().unwrap().to_str().unwrap();
+            let air_file = format!("{out_dir}/{stem}.air");
+
+            let status = Command::new("xcrun")
+                .args([
+                    "-sdk",
+                    "macosx",
+                    "metal",
+                    "-std=macos-metal2.0",
+                    "-mmacos-version-min=13.0",
+                    "-c",
+                    metal_file.to_str().unwrap(),
+                    "-o",
+                    &air_file,
+                ])
+                .status()
+                .expect("Failed to run xcrun metal compiler. Is Xcode installed?");
+            assert!(
+                status.success(),
+                "Metal shader compilation failed for {metal_file:?}"
+            );
+            air_files.push(air_file);
+        }
+
+        let metallib_path = format!("{out_dir}/shaders.metallib");
+        let mut cmd = Command::new("xcrun");
+        cmd.args(["-sdk", "macosx", "metallib"]);
+        for air in &air_files {
+            cmd.arg(air);
+        }
+        cmd.args(["-o", &metallib_path]);
+        let status = cmd.status().expect("Failed to run xcrun metallib linker");
+        assert!(status.success(), "Metal library linking failed");
+    }
+
+    // Re-run if any WGSL source changes
+    if let Ok(dir_entries) = std::fs::read_dir(shader_dir) {
+        for dir_entry in dir_entries.flatten() {
+            let path = dir_entry.path();
+            if path.extension().is_some_and(|ext| ext == "wgsl") {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+}
 
 /// Compile Metal shaders from a directory.
 ///
@@ -291,5 +498,18 @@ macro_rules! include_metallib {
 macro_rules! include_hlsl_shader {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".cso"))
+    };
+}
+
+/// Load an embedded GLSL shader source transpiled from WGSL by
+/// [`compile_wgsl_shaders`].
+///
+/// The `$name` argument is the entry point name used during compilation.
+///
+/// Expands to `include_str!(concat!(env!("OUT_DIR"), "/", $name, ".glsl"))`.
+#[macro_export]
+macro_rules! include_glsl_shader {
+    ($name:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/", $name, ".glsl"))
     };
 }
