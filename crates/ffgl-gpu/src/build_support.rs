@@ -159,52 +159,48 @@ pub fn compile_wgsl_shaders(shader_dir: &Path, entries: &[WgslEntry]) {
             metal_files.push(std::path::PathBuf::from(metal_path));
         }
 
-        // --- Windows: Transpile each entry point to GLSL 4.60 ---
-        #[cfg(target_os = "windows")]
-        {
-            for entry in file_entries {
-                let mut glsl_source = String::new();
-                let mut writer = naga::back::glsl::Writer::new(
-                    &mut glsl_source,
-                    &module,
-                    &info,
-                    &naga::back::glsl::Options {
-                        version: naga::back::glsl::Version::Desktop(460),
-                        writer_flags: naga::back::glsl::WriterFlags::empty(),
-                        binding_map: Default::default(),
-                        zero_initialize_workgroup_memory: true,
-                    },
-                    &naga::back::glsl::PipelineOptions {
-                        shader_stage: entry.stage.to_naga(),
-                        entry_point: entry.entry_point.to_string(),
-                        multiview: None,
-                    },
-                    naga::proc::BoundsCheckPolicies::default(),
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "GLSL writer init failed for {}:{}: {e}",
-                        file, entry.entry_point
-                    );
-                });
+        // --- Transpile each entry point to GLSL 4.60 ---
+        // Always generated (pure Rust, no platform dependency) so cross-compilation works.
+        for entry in file_entries.iter() {
+            let mut glsl_source = String::new();
+            let glsl_options = naga::back::glsl::Options {
+                version: naga::back::glsl::Version::Desktop(460),
+                writer_flags: naga::back::glsl::WriterFlags::empty(),
+                binding_map: Default::default(),
+                zero_initialize_workgroup_memory: true,
+            };
+            let pipeline_options = naga::back::glsl::PipelineOptions {
+                shader_stage: entry.stage.to_naga(),
+                entry_point: entry.entry_point.to_string(),
+                multiview: None,
+            };
+            let mut writer = naga::back::glsl::Writer::new(
+                &mut glsl_source,
+                &module,
+                &info,
+                &glsl_options,
+                &pipeline_options,
+                naga::proc::BoundsCheckPolicies::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "GLSL writer init failed for {}:{}: {e}",
+                    file, entry.entry_point
+                );
+            });
 
-                writer.write().unwrap_or_else(|e| {
-                    panic!(
-                        "GLSL transpilation failed for {}:{}: {e}",
-                        file, entry.entry_point
-                    );
-                });
+            writer.write().unwrap_or_else(|e| {
+                panic!(
+                    "GLSL transpilation failed for {}:{}: {e}",
+                    file, entry.entry_point
+                );
+            });
 
-                let glsl_path = format!("{out_dir}/{}.glsl", entry.entry_point);
-                std::fs::write(&glsl_path, &glsl_source).unwrap_or_else(|e| {
-                    panic!("Failed to write {glsl_path}: {e}");
-                });
-            }
+            let glsl_path = format!("{out_dir}/{}.glsl", entry.entry_point);
+            std::fs::write(&glsl_path, &glsl_source).unwrap_or_else(|e| {
+                panic!("Failed to write {glsl_path}: {e}");
+            });
         }
-
-        // Suppress unused variable warning when neither Mac nor Windows
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let _ = file_entries;
     }
 
     // --- macOS: Compile .metal → .air → .metallib ---
