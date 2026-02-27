@@ -1,8 +1,9 @@
 //! GPU context wrapping platform-specific device + loaded shader library.
 //!
 //! Created lazily on first draw. On macOS this holds a [`MetalDevice`] and the
-//! compiled Metal shader library. On Windows it holds a [`Dx11Device`] (shaders
-//! are loaded individually per-pipeline from bytecode).
+//! compiled Metal shader library. On other platforms it holds a map of GLSL
+//! shader sources keyed by entry-point name (compiled at runtime by the GL
+//! driver).
 
 use anyhow::Result;
 
@@ -16,20 +17,21 @@ use objc2_metal::MTLLibrary;
 /// GPU context wrapping platform-specific device + loaded shader library.
 ///
 /// On macOS this contains a `MetalDevice` and the compiled shader library
-/// (`.metallib`). On Windows it contains a `Dx11Device`; shaders are loaded
-/// individually per-pipeline from compiled bytecode (`.cso`).
+/// (`.metallib`). On other platforms it holds GLSL shader source strings
+/// keyed by entry-point name; shaders are compiled at runtime by the GL
+/// driver when pipelines are created.
 pub struct GpuContext {
     #[cfg(target_os = "macos")]
     pub(crate) device: gpu_interop::metal::MetalDevice,
     #[cfg(target_os = "macos")]
     pub(crate) library: Retained<ProtocolObject<dyn MTLLibrary>>,
 
-    #[cfg(target_os = "windows")]
-    pub(crate) device: gpu_interop::dx11::Dx11Device,
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) shader_sources: std::collections::HashMap<String, String>,
 }
 
 impl GpuContext {
-    /// Create from embedded Metal shader library bytes.
+    /// Create from embedded Metal shader library bytes (macOS).
     ///
     /// The `metallib_bytes` should come from [`include_metallib!`] which embeds
     /// the compiled `.metallib` at build time.
@@ -50,15 +52,18 @@ impl GpuContext {
         Ok(Self { device, library })
     }
 
-    /// Create a DX11 GPU context.
+    /// Create from GLSL shader sources (non-macOS).
     ///
-    /// On Windows, shaders are loaded individually per-pipeline from compiled
-    /// bytecode, so no library bytes are needed at construction time.
-    #[cfg(target_os = "windows")]
-    pub fn new() -> Result<Self> {
-        let device = gpu_interop::dx11::Dx11Device::new()
-            .ok_or_else(|| anyhow::anyhow!("Failed to create D3D11 device"))?;
-        Ok(Self { device })
+    /// The `sources` slice contains `(name, glsl_source)` pairs. Each name
+    /// corresponds to a WGSL entry point transpiled to GLSL at build time.
+    /// Shaders are compiled by the GL driver when pipelines are created.
+    #[cfg(not(target_os = "macos"))]
+    pub fn new(sources: &[(&str, &str)]) -> Result<Self> {
+        let shader_sources = sources
+            .iter()
+            .map(|(name, src)| (name.to_string(), src.to_string()))
+            .collect();
+        Ok(Self { shader_sources })
     }
 
     /// Borrow the underlying Metal device (macOS).
@@ -71,11 +76,5 @@ impl GpuContext {
     #[cfg(target_os = "macos")]
     pub fn metal_library(&self) -> &ProtocolObject<dyn MTLLibrary> {
         &self.library
-    }
-
-    /// Borrow the underlying DX11 device (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn dx11_device(&self) -> &gpu_interop::dx11::Dx11Device {
-        &self.device
     }
 }

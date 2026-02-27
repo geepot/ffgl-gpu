@@ -312,35 +312,43 @@ mod metal_draw {
                         use_bilinear,
                     );
 
-                    // Extract texture references via raw pointers to avoid
-                    // conflicting borrows (shared refs to textures + mutable
-                    // ref to bridge in DrawInput).
-                    let input_ptr = match bridge.input_metal_texture() {
-                        Some(t) => t as *const _,
-                        None => return false,
-                    };
-                    let output_ptr = match bridge.output_metal_texture() {
-                        Some(t) => t as *const _,
-                        None => return false,
-                    };
-
-                    // SAFETY: The texture pointers point into bridge's internal
-                    // IOSurface-backed texture pairs. They remain valid for the
+                    // Extract texture pointers from the bridge and wrap in
+                    // GpuTexture. The raw pointers remain valid for the
                     // duration of gpu_draw because the bridge is held by this
                     // scope and no bridge methods that invalidate textures are
                     // called until after gpu_draw returns.
+                    let input_tex = match bridge.input_metal_texture() {
+                        Some(t) => crate::texture::GpuTexture {
+                            metal: t as *const _,
+                            width: proc_width,
+                            height: proc_height,
+                        },
+                        None => return false,
+                    };
+                    let output_tex = match bridge.output_metal_texture() {
+                        Some(t) => crate::texture::GpuTexture {
+                            metal: t as *const _,
+                            width: proc_width,
+                            height: proc_height,
+                        },
+                        None => return false,
+                    };
+
                     let mut draw_input = DrawInput {
-                        input: unsafe { &*input_ptr },
-                        output: unsafe { &*output_ptr },
+                        input: &input_tex,
+                        output: &output_tex,
                         width: proc_width,
                         height: proc_height,
-                        bridge,
+                        pending_work: None,
                     };
 
                     plugin.gpu_draw(ctx, &mut draw_input, data, frame_counter);
 
-                    // Reclaim bridge from DrawInput for post-draw operations.
-                    let bridge = draw_input.bridge;
+                    // Store pending work command buffer in bridge for
+                    // double-buffer sync.
+                    if let Some(pending) = draw_input.pending_work.take() {
+                        bridge.store_command_buffer(pending.command_buffer);
+                    }
 
                     bridge.mark_dispatch(frame_counter);
 

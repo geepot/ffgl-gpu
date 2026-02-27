@@ -7,93 +7,46 @@
 //! pre-extracted platform textures.
 
 use crate::context::GpuContext;
+use crate::texture::GpuTexture;
 use ffgl_core::FFGLData;
 
 // ---------------------------------------------------------------------------
-// DrawInput — platform-specific pre-extracted textures
+// DrawInput — unified pre-extracted textures
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
-mod draw_input_impl {
-    use gpu_interop::metal::GlMetalBridge;
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::MTLTexture;
+/// Pre-extracted GPU textures for the current frame.
+///
+/// The framework populates this from the bridge before calling
+/// [`GpuPlugin::gpu_draw`]. Public fields give direct access to the
+/// platform-agnostic input/output textures.
+///
+/// After performing GPU work via [`GpuContext`] dispatch methods, call
+/// [`store_pending`](DrawInput::store_pending) with the returned
+/// [`PendingWork`](crate::dispatch::PendingWork) so the framework can
+/// synchronise the double-buffered pipeline.
+pub struct DrawInput<'a> {
+    /// Input texture (the host's frame, already blitted).
+    pub input: &'a GpuTexture,
+    /// Output texture (write your result here).
+    pub output: &'a GpuTexture,
+    /// Processing width in pixels.
+    pub width: u32,
+    /// Processing height in pixels.
+    pub height: u32,
+    /// Internal: bridge stores pending work for double-buffer sync.
+    pub(crate) pending_work: Option<crate::dispatch::PendingWork>,
+}
 
-    /// Pre-extracted GPU textures for the current frame.
+impl DrawInput<'_> {
+    /// Store completed GPU work for the framework's double-buffer pipeline.
     ///
-    /// The framework populates this from the bridge before calling
-    /// [`super::GpuPlugin::gpu_draw`]. Public fields give direct access to
-    /// the input/output textures; the raw bridge is available via
-    /// [`metal_bridge`](DrawInput::metal_bridge) for advanced operations
-    /// like [`store_command_buffer`](GlMetalBridge::store_command_buffer).
-    pub struct DrawInput<'a> {
-        /// Input texture (the host's frame, already blitted).
-        pub input: &'a ProtocolObject<dyn MTLTexture>,
-        /// Output texture (write your result here).
-        pub output: &'a ProtocolObject<dyn MTLTexture>,
-        /// Processing width in pixels.
-        pub width: u32,
-        /// Processing height in pixels.
-        pub height: u32,
-        pub(crate) bridge: &'a mut GlMetalBridge,
-    }
-
-    impl<'a> DrawInput<'a> {
-        /// Access the underlying Metal bridge for advanced operations
-        /// (e.g. `store_command_buffer`, `back_output_metal_texture`).
-        pub fn metal_bridge(&mut self) -> &mut GlMetalBridge {
-            self.bridge
-        }
+    /// Call this after dispatching compute or render work. The framework
+    /// will use the stored [`PendingWork`](crate::dispatch::PendingWork) to
+    /// synchronise output before presenting.
+    pub fn store_pending(&mut self, work: crate::dispatch::PendingWork) {
+        self.pending_work = Some(work);
     }
 }
-
-#[cfg(target_os = "windows")]
-mod draw_input_impl {
-    use gpu_interop::dx11::GlDx11Bridge;
-    use windows::Win32::Graphics::Direct3D11::*;
-
-    /// Pre-extracted GPU textures for the current frame.
-    ///
-    /// The framework populates this from the bridge before calling
-    /// [`super::GpuPlugin::gpu_draw`]. Public fields give direct access to
-    /// the input/output views; the raw bridge is available via
-    /// [`dx11_bridge`](DrawInput::dx11_bridge) for advanced operations.
-    pub struct DrawInput<'a> {
-        /// Input SRV (read the host's frame from this).
-        pub input_srv: ID3D11ShaderResourceView,
-        /// Output UAV (write your result here).
-        pub output_uav: ID3D11UnorderedAccessView,
-        /// Output texture (use as render target for render pipelines).
-        pub output_texture: ID3D11Texture2D,
-        /// Processing width in pixels.
-        pub width: u32,
-        /// Processing height in pixels.
-        pub height: u32,
-        pub(crate) bridge: &'a mut GlDx11Bridge,
-    }
-
-    impl<'a> DrawInput<'a> {
-        /// Access the underlying DX11 bridge for advanced operations
-        /// (e.g. `device`, `context`, `back_output_srv`).
-        pub fn dx11_bridge(&mut self) -> &mut GlDx11Bridge {
-            self.bridge
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-mod draw_input_impl {
-    /// Stub for unsupported platforms.
-    pub struct DrawInput<'a> {
-        /// Processing width in pixels.
-        pub width: u32,
-        /// Processing height in pixels.
-        pub height: u32,
-        pub(crate) _lifetime: std::marker::PhantomData<&'a ()>,
-    }
-}
-
-pub use draw_input_impl::DrawInput;
 
 // ---------------------------------------------------------------------------
 // GpuPlugin trait
