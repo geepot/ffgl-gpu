@@ -20,3 +20,6 @@ dispatch2 = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
+
+[build-dependencies]
+naga = { workspace = true }
