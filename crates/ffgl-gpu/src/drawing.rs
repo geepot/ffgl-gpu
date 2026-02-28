@@ -2,8 +2,8 @@
 //!
 //! This module provides [`draw_gpu_effect`], the main entry point that handles:
 //! - Lazy GPU context initialization
-//! - GL-to-GPU bridge management (Metal via IOSurface, DX11 via
-//!   WGL_NV_DX_interop2)
+//! - GL-to-GPU bridge management (Metal via IOSurface on macOS, GL compute
+//!   scratch textures on other platforms)
 //! - Double-buffered pipelining (one frame latency)
 //! - GL state save/restore
 //! - Instance tracking (resource release on instance switch)
@@ -34,6 +34,7 @@ struct SavedGlState {
     texture_2d: GLint,
     active_texture: GLint,
     vao: GLint,
+    current_program: GLint,
     viewport: [GLint; 4],
 }
 
@@ -48,6 +49,7 @@ impl SavedGlState {
             texture_2d: 0,
             active_texture: 0,
             vao: 0,
+            current_program: 0,
             viewport: [0; 4],
         };
         gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut s.pack_buffer);
@@ -58,6 +60,7 @@ impl SavedGlState {
         gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut s.texture_2d);
         gl::GetIntegerv(gl::ACTIVE_TEXTURE, &mut s.active_texture);
         gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut s.vao);
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut s.current_program);
         gl::GetIntegerv(gl::VIEWPORT, s.viewport.as_mut_ptr());
         s
     }
@@ -71,6 +74,7 @@ impl SavedGlState {
         gl::ActiveTexture(self.active_texture as GLenum);
         gl::BindTexture(gl::TEXTURE_2D, self.texture_2d as GLuint);
         gl::BindVertexArray(self.vao as GLuint);
+        gl::UseProgram(self.current_program as GLuint);
         gl::Viewport(
             self.viewport[0],
             self.viewport[1],
@@ -380,17 +384,17 @@ mod metal_draw {
 }
 
 // ---------------------------------------------------------------------------
-// Windows DX11 draw path
+// GL compute draw path (non-macOS)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "windows")]
-mod dx11_draw {
+#[cfg(not(target_os = "macos"))]
+mod gl_draw {
     use super::*;
-    use gpu_interop::dx11::GlDx11Bridge;
+    use gpu_interop::gl_compute::GlComputeBridge;
 
     thread_local! {
         static GPU_CTX: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
-        static BRIDGE: RefCell<Option<GlDx11Bridge>> = const { RefCell::new(None) };
+        static BRIDGE: RefCell<Option<GlComputeBridge>> = const { RefCell::new(None) };
         static LAST_INSTANCE_ID: RefCell<Option<u64>> = const { RefCell::new(None) };
         static GPU_INITIALIZED: RefCell<bool> = const { RefCell::new(false) };
     }
@@ -443,7 +447,7 @@ mod dx11_draw {
         frame_counter: u64,
         internal_resolution: f32,
         filter_quality: f32,
-        _metallib_bytes: &[u8],
+        glsl_sources: &[(&str, &str)],
     ) {
         ensure_instance_resources(instance_id);
         if !validate_gl_state() {
@@ -458,11 +462,11 @@ mod dx11_draw {
         let proc_height = ((height as f32 * res_scale) as u32).max(2);
         let use_bilinear = filter_quality >= 0.5;
 
-        // Ensure D3D11 context is initialized
+        // Ensure GPU context is initialized with GLSL shader sources.
         let ctx_available = GPU_CTX.with(|cell| {
             let mut ctx = cell.borrow_mut();
             if ctx.is_none() {
-                match GpuContext::new() {
+                match GpuContext::new(glsl_sources) {
                     Ok(c) => *ctx = Some(c),
                     Err(e) => {
                         error!("Failed to create GPU context: {e}");
@@ -478,28 +482,7 @@ mod dx11_draw {
             return;
         }
 
-        // Ensure GL-D3D11 interop bridge is initialized
-        let bridge_available = GPU_CTX.with(|ctx_cell| {
-            let ctx = ctx_cell.borrow();
-            let ctx = ctx.as_ref().unwrap();
-            BRIDGE.with(|bridge_cell| {
-                let mut bridge = bridge_cell.borrow_mut();
-                if bridge.is_none() {
-                    *bridge = GlDx11Bridge::new(
-                        ctx.device.device(),
-                        ctx.device.context(),
-                        ctx.device.query(),
-                    );
-                }
-                bridge.is_some()
-            })
-        });
-
-        if !bridge_available {
-            passthrough(glium, data, frame_data);
-            return;
-        }
-
+        // Get host FBO and texture
         let host_fbo = frame_data.host;
         let tex_id = match frame_data.textures.first() {
             Some(t) => t.Handle,
@@ -516,6 +499,14 @@ mod dx11_draw {
             let ctx = ctx_ref.as_ref().unwrap();
 
             BRIDGE.with(|bridge_cell| {
+                // Initialize bridge if needed.
+                {
+                    let mut bridge_opt = bridge_cell.borrow_mut();
+                    if bridge_opt.is_none() {
+                        *bridge_opt = Some(GlComputeBridge::new());
+                    }
+                }
+
                 // Call gpu_init on first use
                 let init_ok = GPU_INITIALIZED.with(|cell| {
                     let mut initialized = cell.borrow_mut();
@@ -540,7 +531,6 @@ mod dx11_draw {
                 }
 
                 // --- Double-buffered pipelined flow ---
-                // Single mutable borrow for all bridge operations.
                 let mut bridge_opt = bridge_cell.borrow_mut();
                 let bridge = bridge_opt.as_mut().unwrap();
 
@@ -565,42 +555,40 @@ mod dx11_draw {
                     );
                 }
 
+                // No input blit needed — bind host texture directly.
                 bridge.blit_input_from_host_scaled(
-                    tex_id,
-                    width,
-                    height,
-                    proc_width,
-                    proc_height,
-                    use_bilinear,
+                    tex_id, width, height, proc_width, proc_height, use_bilinear,
                 );
 
-                // Extract owned COM refs from bridge (cheap AddRef).
-                let input_srv = match bridge.input_srv() {
-                    Some(s) => s,
-                    None => return false,
+                // Wrap the host's input texture and the bridge's output
+                // texture as GpuTexture handles for the unified API.
+                let input_tex = crate::texture::GpuTexture {
+                    gl_name: tex_id,
+                    gl_format: gl::RGBA8,
+                    width: proc_width,
+                    height: proc_height,
                 };
-                let output_uav = match bridge.output_uav() {
-                    Some(u) => u,
-                    None => return false,
-                };
-                let output_texture = match bridge.output_texture() {
-                    Some(t) => t,
-                    None => return false,
+                let output_gl = bridge.output_gl_texture();
+                let output_tex = crate::texture::GpuTexture {
+                    gl_name: output_gl,
+                    gl_format: gl::RGBA8,
+                    width: proc_width,
+                    height: proc_height,
                 };
 
                 let mut draw_input = DrawInput {
-                    input_srv,
-                    output_uav,
-                    output_texture,
+                    input: &input_tex,
+                    output: &output_tex,
                     width: proc_width,
                     height: proc_height,
-                    bridge,
+                    pending_work: None,
                 };
 
                 plugin.gpu_draw(ctx, &mut draw_input, data, frame_counter);
 
-                // Reclaim bridge from DrawInput for post-draw operations.
-                let bridge = draw_input.bridge;
+                // Drop pending_work (GL fence) — the bridge manages its
+                // own fences via mark_dispatch.
+                drop(draw_input.pending_work.take());
 
                 bridge.mark_dispatch(frame_counter);
 
@@ -640,11 +628,8 @@ pub fn ensure_instance_gl_resources(instance_id: u64) {
     #[cfg(target_os = "macos")]
     metal_draw::ensure_instance_resources(instance_id);
 
-    #[cfg(target_os = "windows")]
-    dx11_draw::ensure_instance_resources(instance_id);
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = instance_id;
+    #[cfg(not(target_os = "macos"))]
+    gl_draw::ensure_instance_resources(instance_id);
 }
 
 /// Validate GL state before drawing. Returns `false` if the GL context is
@@ -653,14 +638,8 @@ pub fn validate_gl_state_before_draw() -> bool {
     #[cfg(target_os = "macos")]
     return metal_draw::validate_gl_state();
 
-    #[cfg(target_os = "windows")]
-    return dx11_draw::validate_gl_state();
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        clear_gl_errors();
-        is_context_current()
-    }
+    #[cfg(not(target_os = "macos"))]
+    return gl_draw::validate_gl_state();
 }
 
 /// Main draw function called by FFGL plugins.
@@ -682,7 +661,9 @@ pub fn validate_gl_state_before_draw() -> bool {
 /// * `filter_quality` - Filter quality `[0.0, 1.0]`. Values >= 0.5 use
 ///   bilinear filtering.
 /// * `metallib_bytes` - Compiled Metal shader library bytes (from
-///   [`include_metallib!`]). Ignored on Windows.
+///   [`include_metallib!`]). Ignored on non-macOS.
+/// * `glsl_sources` - GLSL shader source pairs `(name, source)` for GL
+///   compute. Ignored on macOS.
 pub fn draw_gpu_effect<P: GpuPlugin>(
     plugin: &mut P,
     instance_id: u64,
@@ -693,43 +674,37 @@ pub fn draw_gpu_effect<P: GpuPlugin>(
     internal_resolution: f32,
     filter_quality: f32,
     metallib_bytes: &[u8],
+    glsl_sources: &[(&str, &str)],
 ) {
     #[cfg(target_os = "macos")]
-    metal_draw::draw(
-        plugin,
-        instance_id,
-        glium,
-        data,
-        frame_data,
-        frame_counter,
-        internal_resolution,
-        filter_quality,
-        metallib_bytes,
-    );
-
-    #[cfg(target_os = "windows")]
-    dx11_draw::draw(
-        plugin,
-        instance_id,
-        glium,
-        data,
-        frame_data,
-        frame_counter,
-        internal_resolution,
-        filter_quality,
-        metallib_bytes,
-    );
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (
+        let _ = glsl_sources;
+        metal_draw::draw(
             plugin,
             instance_id,
+            glium,
+            data,
+            frame_data,
             frame_counter,
             internal_resolution,
             filter_quality,
             metallib_bytes,
         );
-        passthrough(glium, data, frame_data);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = metallib_bytes;
+        gl_draw::draw(
+            plugin,
+            instance_id,
+            glium,
+            data,
+            frame_data,
+            frame_counter,
+            internal_resolution,
+            filter_quality,
+            glsl_sources,
+        );
     }
 }

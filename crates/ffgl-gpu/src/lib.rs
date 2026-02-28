@@ -3,8 +3,8 @@
 //! High-level FFGL GPU plugin framework.
 //!
 //! This crate ties together [`ffgl_core`] (host protocol), [`ffgl_glium`]
-//! (OpenGL context), and [`gpu_interop`] (GL-to-Metal/DX11 bridging) into a
-//! single framework for writing GPU-accelerated FFGL plugins.
+//! (OpenGL context), and [`gpu_interop`] (GL-to-Metal / GL compute bridging)
+//! into a single framework for writing GPU-accelerated FFGL plugins.
 //!
 //! # Overview
 //!
@@ -18,10 +18,10 @@
 //!
 //! # Build-time shader compilation
 //!
-//! Use [`build_support::compile_metal_shaders`] and
-//! [`build_support::compile_hlsl_shaders`] in your plugin's `build.rs`, then
-//! load the compiled shaders with [`include_metallib!`] and
-//! [`include_hlsl_shader!`].
+//! Use [`build_support::compile_wgsl_shaders`] in your plugin's `build.rs`.
+//! This transpiles WGSL shaders to both Metal (macOS) and GLSL 4.60 (other
+//! platforms). Load them with [`include_metallib!`] and
+//! [`build_support::include_glsl_shader!`].
 
 pub mod buffer;
 pub mod build_support;
