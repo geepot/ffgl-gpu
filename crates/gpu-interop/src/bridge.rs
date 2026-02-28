@@ -5,8 +5,8 @@ use gl::types::GLuint;
 
 /// Common interface for GL-to-GPU texture bridging.
 ///
-/// Implementations exist for Metal (macOS via IOSurface) and DX11 (Windows via
-/// `WGL_NV_DX_interop2`).
+/// Implementations exist for Metal (macOS via IOSurface) and GL compute
+/// (non-macOS, running in the host's own GL context).
 ///
 /// The bridge manages a pair of shared textures (front/back) for double-buffered
 /// rendering. Input textures receive data from the host's OpenGL FBO, and output

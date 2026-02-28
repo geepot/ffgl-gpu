@@ -13,8 +13,5 @@ pub use bridge::GpuBridge;
 #[cfg(target_os = "macos")]
 pub mod metal;
 
-#[cfg(target_os = "windows")]
-pub mod dx11;
-
 #[cfg(not(target_os = "macos"))]
 pub mod gl_compute;

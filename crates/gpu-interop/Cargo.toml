@@ -16,6 +16,3 @@ objc2-io-surface = { workspace = true }
 objc2-open-gl = { workspace = true }
 objc2-core-foundation = { workspace = true }
 dispatch2 = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true }
