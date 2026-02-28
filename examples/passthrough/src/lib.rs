@@ -22,6 +22,11 @@ const METALLIB_BYTES: &[u8] = ffgl_gpu::include_metallib!();
 #[cfg(not(target_os = "macos"))]
 const METALLIB_BYTES: &[u8] = &[];
 
+/// GLSL shader sources transpiled from WGSL at build time.
+const GLSL_SOURCES: &[(&str, &str)] = &[
+    ("passthrough", ffgl_gpu::include_glsl_shader!("passthrough")),
+];
+
 struct GpuState {
     pipeline: Option<ComputePipeline>,
 }
@@ -39,33 +44,23 @@ impl GpuPlugin for GpuState {
         _data: &FFGLData,
         _frame: u64,
     ) {
-        #[cfg(target_os = "macos")]
-        {
-            let pipeline = match &self.pipeline {
-                Some(p) => p,
-                None => return,
-            };
+        let pipeline = match &self.pipeline {
+            Some(p) => p,
+            None => return,
+        };
 
-            let pending = match ctx.dispatch_compute(
-                pipeline,
-                &[input.input, input.output],
-                &[],
-                &[],
-                (input.width as usize, input.height as usize),
-                (16, 16),
-            ) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            input
-                .metal_bridge()
-                .store_command_buffer(pending.into_command_buffer());
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (ctx, input);
-        }
+        let pending = match ctx.dispatch_compute(
+            pipeline,
+            &[input.input, input.output],
+            &[],
+            &[],
+            (input.width as usize, input.height as usize),
+            (16, 16),
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        input.store_pending(pending);
     }
 }
 
@@ -117,6 +112,7 @@ impl SimpleFFGLInstance for Passthrough {
             1.0,
             1.0,
             METALLIB_BYTES,
+            GLSL_SOURCES,
         );
     }
 }
