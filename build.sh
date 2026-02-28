@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# FFGL DX11/Metal Plugin Cross-Platform Build Script
+# FFGL Plugin Cross-Platform Build Script (unified WGSL → Metal/GLSL)
 # Builds plugins for macOS (arm64/x86_64/universal) and Windows (x86_64)
 
 set -e
@@ -335,7 +335,7 @@ create_universal_binary() {
 
 # Main build function
 main() {
-    log_info "FFGL DX11/Metal Plugin Build System"
+    log_info "FFGL Plugin Build System (WGSL transpiled)"
     log_info "Platform: $PLATFORM, Architecture: $ARCH, Plugin: $PLUGIN, Profile: $PROFILE, Toolchain: $TOOLCHAIN"
 
     # Resolve current platform/arch

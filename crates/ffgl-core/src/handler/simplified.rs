@@ -36,6 +36,10 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
         panic!("No params")
     }
 
+    fn get_param_events(&mut self, _index: usize) -> u64 {
+        0
+    }
+
     /// Called by [crate::conversions::Op::ProcessOpenGL] to draw the plugin
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput);
 }
@@ -47,6 +51,10 @@ impl<T: SimpleFFGLInstance> FFGLInstance for T {
 
     fn set_param(&mut self, index: usize, value: f32) {
         SimpleFFGLInstance::set_param(self, index, value)
+    }
+
+    fn get_param_events(&mut self, index: usize) -> u64 {
+        SimpleFFGLInstance::get_param_events(self, index)
     }
 
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput) {

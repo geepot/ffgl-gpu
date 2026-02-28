@@ -32,6 +32,12 @@ pub trait FFGLInstance {
     fn get_param(&self, index: usize) -> f32;
     fn set_param(&mut self, index: usize, value: f32);
 
+    /// Return pending event flags for a parameter and clear them.
+    /// Return 0 if no events pending. Flags are `FF_EVENT_FLAG_*` constants.
+    fn get_param_events(&mut self, _index: usize) -> u64 {
+        0
+    }
+
     /// Called by [crate::conversions::Op::ProcessOpenGL] to draw the plugin
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput);
 }

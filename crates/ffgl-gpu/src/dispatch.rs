@@ -108,6 +108,34 @@ mod metal_impl {
         [1.0, 1.0, 1.0, 0.0],   // top-right
     ];
 
+    /// Remap WGSL `@binding` indices to sequential Metal buffer indices.
+    ///
+    /// Metal has separate binding tables for textures and buffers.  The
+    /// build-time `build_msl_binding_map` assigns `[[buffer(N)]]` slots
+    /// sequentially (sorted by WGSL binding) starting at 0, regardless of
+    /// the original `@binding` numbers.  We must apply the same remapping
+    /// at dispatch time so `setBuffer`/`setBytes` target the correct slot.
+    fn remap_buffer_indices(
+        buffers: &[(&GpuBuffer, usize)],
+        bytes: &[(&[u8], usize)],
+    ) -> Vec<usize> {
+        let mut wgsl_bindings: Vec<usize> = buffers
+            .iter()
+            .map(|(_, idx)| *idx)
+            .chain(bytes.iter().map(|(_, idx)| *idx))
+            .collect();
+        wgsl_bindings.sort();
+        wgsl_bindings.dedup();
+        wgsl_bindings
+    }
+
+    fn metal_buffer_index(wgsl_binding: usize, sorted_bindings: &[usize]) -> usize {
+        sorted_bindings
+            .iter()
+            .position(|&b| b == wgsl_binding)
+            .unwrap_or(wgsl_binding)
+    }
+
     /// Encode a compute dispatch onto `encoder`: set pipeline, bind resources,
     /// dispatch threads, and end the encoder.
     fn encode_compute_inner(
@@ -127,18 +155,23 @@ mod metal_impl {
             }
         }
 
+        // Remap WGSL @binding indices to sequential Metal [[buffer(N)]] slots
+        let sorted_bindings = remap_buffer_indices(buffers, bytes);
+
         for (buf, idx) in buffers {
+            let metal_idx = metal_buffer_index(*idx, &sorted_bindings);
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&buf.metal), 0, *idx);
+                encoder.setBuffer_offset_atIndex(Some(&buf.metal), 0, metal_idx);
             }
         }
 
         for (data, idx) in bytes {
+            let metal_idx = metal_buffer_index(*idx, &sorted_bindings);
             unsafe {
                 encoder.setBytes_length_atIndex(
                     std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
                     data.len(),
-                    *idx,
+                    metal_idx,
                 );
             }
         }
@@ -195,13 +228,15 @@ mod metal_impl {
             }
         }
 
-        // Bind fragment constant data
+        // Bind fragment constant data (remap WGSL binding → Metal buffer index)
+        let sorted_frag_bindings = remap_buffer_indices(&[], fragment_bytes);
         for (data, index) in fragment_bytes {
+            let metal_idx = metal_buffer_index(*index, &sorted_frag_bindings);
             unsafe {
                 encoder.setFragmentBytes_length_atIndex(
                     std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut _),
                     data.len(),
-                    *index,
+                    metal_idx,
                 );
             }
         }

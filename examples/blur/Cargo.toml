@@ -1,5 +1,5 @@
 [package]
-name = "ffgl-passthrough"
+name = "ffgl-blur"
 version = "0.1.0"
 edition.workspace = true
 
@@ -10,8 +10,6 @@ crate-type = ["cdylib"]
 ffgl-core = { workspace = true }
 ffgl-glium = { workspace = true }
 ffgl-gpu = { workspace = true }
-gpu-interop = { workspace = true }
-gl = { workspace = true }
 anyhow = { workspace = true }
 
 [build-dependencies]

@@ -5,6 +5,9 @@ members = [
     "crates/gpu-interop",
     "crates/ffgl-gpu",
     "examples/passthrough",
+    "examples/invert",
+    "examples/blur",
+    "examples/kitchen-sink",
 ]
 resolver = "2"
 
@@ -42,3 +45,8 @@ objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "objc2-core-fo
 objc2-open-gl = { version = "0.3", features = ["IOSurface", "CGLTypes", "CGLCurrent"] }
 objc2-core-foundation = "0.3"
 dispatch2 = "0.3"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
