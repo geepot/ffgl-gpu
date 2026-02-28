@@ -93,8 +93,8 @@ pub trait GpuPlugin: Send + Sync + 'static {
     /// 2. Perform GPU compute/render work
     /// 3. Write results to the output texture
     ///
-    /// For advanced operations (e.g. `store_command_buffer` on Metal), use
-    /// `input.metal_bridge()` or `input.dx11_bridge()`.
+    /// After dispatching GPU work, call [`DrawInput::store_pending`] with
+    /// the returned [`PendingWork`](crate::dispatch::PendingWork).
     ///
     /// The `frame` counter is monotonically increasing and can be used for
     /// animation or temporal effects.
