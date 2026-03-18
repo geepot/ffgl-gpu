@@ -36,6 +36,11 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
         panic!("No params")
     }
 
+    /// Consume pending parameter events. Override to push value changes to host.
+    fn consume_param_events(&mut self, _max_events: usize) -> Vec<(u32, u64)> {
+        vec![]
+    }
+
     /// Called by [crate::conversions::Op::ProcessOpenGL] to draw the plugin
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput);
 }
@@ -47,6 +52,10 @@ impl<T: SimpleFFGLInstance> FFGLInstance for T {
 
     fn set_param(&mut self, index: usize, value: f32) {
         SimpleFFGLInstance::set_param(self, index, value)
+    }
+
+    fn consume_param_events(&mut self, max_events: usize) -> Vec<(u32, u64)> {
+        SimpleFFGLInstance::consume_param_events(self, max_events)
     }
 
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput) {
