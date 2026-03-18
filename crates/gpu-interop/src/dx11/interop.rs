@@ -503,39 +503,6 @@ impl GlDx11Bridge {
         result != 0
     }
 
-    /// Lock the front pair's GL textures (both input and output) for GL access.
-    /// Must be called before any GL operations on shared textures.
-    unsafe fn lock_gl_textures_front(&self) -> bool {
-        let pair = match &self.pairs[self.front] {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let mut handles = [pair.input.interop_handle, pair.output.interop_handle];
-        let result = (self.wgl_fns.dx_lock_objects)(
-            self.interop_device,
-            handles.len() as GLint,
-            handles.as_mut_ptr(),
-        );
-        result != 0
-    }
-
-    /// Unlock the front pair's GL textures (both input and output) to release them back to D3D11.
-    unsafe fn unlock_gl_textures_front(&self) -> bool {
-        let pair = match &self.pairs[self.front] {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let mut handles = [pair.input.interop_handle, pair.output.interop_handle];
-        let result = (self.wgl_fns.dx_unlock_objects)(
-            self.interop_device,
-            handles.len() as GLint,
-            handles.as_mut_ptr(),
-        );
-        result != 0
-    }
-
     /// Lock the back pair's output GL texture for GL access (for reading the result).
     unsafe fn lock_gl_texture_back_output(&self) -> bool {
         let back = 1 - self.front;
