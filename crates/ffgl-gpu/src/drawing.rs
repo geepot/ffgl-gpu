@@ -480,7 +480,6 @@ mod dx11_draw {
                     *bridge = GlDx11Bridge::new(
                         ctx.device.device(),
                         ctx.device.context(),
-                        ctx.device.query(),
                     );
                 }
                 bridge.is_some()

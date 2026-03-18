@@ -22,6 +22,10 @@ use crate::GpuBridge;
 /// WGL_NV_DX_interop2 constants.
 const WGL_ACCESS_READ_WRITE_NV: GLenum = 0x0001;
 
+/// Number of GPU query slots in the ring buffer. Allows draining older queries
+/// (which are already complete) before checking the latest, reducing spin time.
+const PIPELINE_DEPTH: usize = 3;
+
 // ---------------------------------------------------------------------------
 // WGL function pointer types
 // ---------------------------------------------------------------------------
@@ -138,7 +142,7 @@ impl SharedTexture {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -240,7 +244,7 @@ impl SharedTexturePair {
 
         // Create and cache the SRV for the input texture
         let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_SRV {
@@ -261,7 +265,7 @@ impl SharedTexturePair {
 
         // Create and cache the UAV for the output texture
         let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_UAV { MipSlice: 0 },
@@ -313,8 +317,13 @@ pub struct GlDx11Bridge {
     device: ID3D11Device,
     /// Reference to the immediate context (for GPU sync queries).
     context: ID3D11DeviceContext,
-    /// GPU event query for waiting on dispatch completion.
-    gpu_query: ID3D11Query,
+    /// Ring buffer of GPU sync queries. Draining oldest-first avoids spinning
+    /// on the most recent query (which may not be complete yet).
+    gpu_queries: [ID3D11Query; PIPELINE_DEPTH],
+    /// Total dispatches issued (monotonic counter, used as ring index).
+    dispatch_count: u64,
+    /// Number of queries not yet confirmed complete (0..PIPELINE_DEPTH).
+    pending_queries: u32,
     /// Loaded WGL interop function pointers.
     wgl_fns: WglInteropFunctions,
     /// WGL interop device handle from wglDXOpenDeviceNV.
@@ -323,14 +332,12 @@ pub struct GlDx11Bridge {
     pairs: [Option<SharedTexturePair>; 2],
     /// Index of the pair currently being written by D3D11 compute.
     front: usize,
-    /// Whether the previous frame's D3D11 dispatch has been signaled as complete.
-    pending_dispatch: bool,
     /// Frame counter from the most recent draw call that dispatched D3D11 compute.
     last_dispatch_frame: Option<u64>,
     /// Wall-clock time of the most recent dispatch. Used to detect stale
     /// back-buffer data after deselection/reselection (where the frame counter
     /// is consecutive but real time has a gap).
-    last_dispatch_time: Option<Instant>,
+    last_dispatch_time: Instant,
     read_fbo: GLuint,
     draw_fbo: GLuint,
     dimensions: (u32, u32),
@@ -344,7 +351,6 @@ impl GlDx11Bridge {
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        query: &ID3D11Query,
     ) -> Option<Self> {
         let wgl_fns = WglInteropFunctions::load()?;
 
@@ -359,19 +365,27 @@ impl GlDx11Bridge {
             return None;
         }
 
+        // Create ring buffer of GPU sync queries
+        let gpu_queries = [
+            super::device::create_event_query(device)?,
+            super::device::create_event_query(device)?,
+            super::device::create_event_query(device)?,
+        ];
+
         debug!("GL-D3D11 interop bridge initialized via WGL_NV_DX_interop2");
 
         Some(Self {
             device: device.clone(),
             context: context.clone(),
-            gpu_query: query.clone(),
+            gpu_queries,
+            dispatch_count: 0,
+            pending_queries: 0,
             wgl_fns,
             interop_device,
             pairs: [None, None],
             front: 0,
-            pending_dispatch: false,
             last_dispatch_frame: None,
-            last_dispatch_time: None,
+            last_dispatch_time: Instant::now(),
             read_fbo: 0,
             draw_fbo: 0,
             dimensions: (0, 0),
@@ -448,9 +462,10 @@ impl GlDx11Bridge {
         &self.context
     }
 
-    /// Borrow the GPU event query held by this bridge.
+    /// Borrow the GPU event query for the current ring buffer slot.
     pub fn query(&self) -> &ID3D11Query {
-        &self.gpu_query
+        let slot = (self.dispatch_count % PIPELINE_DEPTH as u64) as usize;
+        &self.gpu_queries[slot]
     }
 
     /// Check whether the bridge FBO handles are still valid.
@@ -575,36 +590,78 @@ impl GlDx11Bridge {
 
     // -- GPU query polling ----------------------------------------------------
 
-    /// Poll the GPU query until the dispatch completes (or timeout).
-    fn poll_gpu_query(&self) {
-        if !self.pending_dispatch {
+    /// Non-blocking check of the oldest pending GPU query.
+    /// Returns true if the oldest query is complete (or no queries are pending).
+    /// Uses DONOTFLUSH to avoid redundant driver flushes during polling.
+    fn poll_oldest_query(&self) -> bool {
+        if self.pending_queries == 0 {
+            return true;
+        }
+        let oldest_slot =
+            ((self.dispatch_count - self.pending_queries as u64) % PIPELINE_DEPTH as u64) as usize;
+        let mut done: u32 = 0;
+        unsafe {
+            // D3D11_ASYNC_GETDATA_DONOTFLUSH (1): don't flush the pipeline on each poll.
+            // We already call Flush() after dispatch, so redundant flushes waste time.
+            let _ = self.context.GetData(
+                &self.gpu_queries[oldest_slot],
+                Some(&mut done as *mut u32 as *mut GLvoid),
+                std::mem::size_of::<u32>() as u32,
+                1,
+            );
+        }
+        done != 0
+    }
+
+    /// Wait for all pending D3D11 dispatches to complete, draining oldest-first.
+    /// Older queries (2+ frames ago) are typically already complete, making their
+    /// checks instantaneous and reducing total spin time on the most recent query.
+    fn wait_for_gpu(&mut self) {
+        if self.pending_queries == 0 {
             return;
         }
         let start = Instant::now();
-        unsafe {
-            // Poll until GPU signals completion or timeout.
-            // For D3D11_QUERY_EVENT, GetData writes a BOOL: TRUE when the GPU is done.
-            // GetData returns S_OK when data is ready and S_FALSE when not yet ready,
-            // but the windows crate maps both to Ok(()) since S_FALSE is a success HRESULT.
-            // Instead of checking the Result, we check the returned BOOL value directly.
-            // On S_FALSE the output buffer is left unmodified, so our zero-init stays 0.
-            loop {
-                let mut done: u32 = 0;
-                let _ = self.context.GetData(
-                    &self.gpu_query,
-                    Some(&mut done as *mut u32 as *mut GLvoid),
-                    std::mem::size_of::<u32>() as u32,
-                    0,
-                );
-                if done != 0 {
-                    break;
-                }
-                if start.elapsed().as_millis() > 100 {
-                    warn!("GPU query timed out after 100ms, proceeding anyway");
-                    break;
-                }
+        while self.pending_queries > 0 {
+            if self.poll_oldest_query() {
+                self.pending_queries -= 1;
+            } else if start.elapsed().as_millis() > 100 {
+                warn!("GPU query timed out after 100ms, proceeding anyway");
+                self.pending_queries = 0;
+                break;
+            } else {
                 std::thread::yield_now();
             }
+        }
+    }
+
+    /// Wait for the most recent D3D11 dispatch WITHOUT clearing pending state.
+    /// Used in the synchronous fallback path (first frame / after gap) so that
+    /// `has_result_ready()` still returns true on the next frame, enabling pipelining.
+    fn wait_for_gpu_pending(&self) {
+        if self.pending_queries == 0 {
+            return;
+        }
+        // Wait for the latest query (most recently issued dispatch)
+        let latest_slot = ((self.dispatch_count - 1) % PIPELINE_DEPTH as u64) as usize;
+        let start = Instant::now();
+        loop {
+            let mut done: u32 = 0;
+            unsafe {
+                let _ = self.context.GetData(
+                    &self.gpu_queries[latest_slot],
+                    Some(&mut done as *mut u32 as *mut GLvoid),
+                    std::mem::size_of::<u32>() as u32,
+                    1,
+                );
+            }
+            if done != 0 {
+                break;
+            }
+            if start.elapsed().as_millis() > 100 {
+                warn!("GPU query timed out after 100ms, proceeding anyway");
+                break;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -701,7 +758,6 @@ impl GpuBridge for GlDx11Bridge {
         self.dimensions = (width, height);
         self.front = 0;
         self.last_dispatch_frame = None;
-        self.last_dispatch_time = None;
         Ok(())
     }
 
@@ -831,6 +887,7 @@ impl GpuBridge for GlDx11Bridge {
             );
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::Flush();
 
             self.unlock_gl_texture_back_output();
         }
@@ -886,6 +943,7 @@ impl GpuBridge for GlDx11Bridge {
             );
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::Flush();
 
             self.unlock_gl_texture_front_output();
         }
@@ -893,22 +951,19 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn has_result_ready(&self, current_frame: u64) -> bool {
-        self.pending_dispatch
+        self.pending_queries > 0
+            && self.last_dispatch_time.elapsed().as_millis() < 250
             && self
                 .last_dispatch_frame
                 .is_some_and(|last| current_frame == last.wrapping_add(1))
-            && self
-                .last_dispatch_time
-                .is_some_and(|t| t.elapsed().as_millis() < 100)
     }
 
     fn wait_for_previous(&mut self) {
-        self.poll_gpu_query();
-        self.pending_dispatch = false;
+        self.wait_for_gpu();
     }
 
     fn wait_for_pending(&mut self) {
-        self.poll_gpu_query();
+        self.wait_for_gpu_pending();
     }
 
     fn swap(&mut self) {
@@ -916,24 +971,21 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn mark_dispatch(&mut self, frame: u64) {
-        // Signal the GPU event query so poll_gpu_query can detect completion.
-        // In the original ntsc-ffgl-plugin this was the caller's responsibility,
-        // but since we now own the context + query it belongs here.
+        let slot = (self.dispatch_count % PIPELINE_DEPTH as u64) as usize;
         unsafe {
-            self.context.End(&self.gpu_query);
+            self.context.End(&self.gpu_queries[slot]);
         }
-        self.pending_dispatch = true;
+        self.dispatch_count += 1;
+        self.pending_queries = (self.pending_queries + 1).min(PIPELINE_DEPTH as u32);
         self.last_dispatch_frame = Some(frame);
-        self.last_dispatch_time = Some(Instant::now());
+        self.last_dispatch_time = Instant::now();
     }
 
     fn cleanup(&mut self) {
-        self.poll_gpu_query();
-        self.pending_dispatch = false;
+        self.wait_for_gpu();
         self.destroy_pairs();
         self.front = 0;
         self.last_dispatch_frame = None;
-        self.last_dispatch_time = None;
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             if self.read_fbo != 0 {
@@ -971,21 +1023,17 @@ unsafe impl Sync for GlDx11Bridge {}
 
 impl Drop for GlDx11Bridge {
     fn drop(&mut self) {
-        // Wait for any in-flight GPU work before destroying shared textures.
-        self.poll_gpu_query();
-        self.pending_dispatch = false;
-        self.destroy_pairs();
-        unsafe {
-            // Unbind before deleting to avoid undefined GL state on some drivers.
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            if self.read_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.read_fbo);
-            }
-            if self.draw_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.draw_fbo);
-            }
-            if !self.interop_device.is_null() {
-                (self.wgl_fns.dx_close_device)(self.interop_device);
+        // Only delete GL/WGL resources if a GL context is still current.
+        // During host shutdown (e.g. Resolume exit), the context may already
+        // be destroyed — AMD drivers crash on gl::Delete* without a context.
+        let has_context = unsafe { !gl::GetString(gl::VERSION).is_null() };
+        if has_context {
+            self.cleanup();
+            unsafe {
+                if !self.interop_device.is_null() {
+                    (self.wgl_fns.dx_close_device)(self.interop_device);
+                    self.interop_device = std::ptr::null_mut();
+                }
             }
         }
     }

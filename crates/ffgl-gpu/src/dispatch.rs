@@ -775,13 +775,13 @@ mod dx11_impl {
             unsafe {
                 ctx.CSSetShader(&pipeline.shader, None);
                 if !uavs.is_empty() {
-                    ctx.CSSetUnorderedAccessViews(0, uavs, None);
+                    ctx.CSSetUnorderedAccessViews(0, uavs.len() as u32, Some(uavs.as_ptr() as *const _), None);
                 }
                 if !srvs.is_empty() {
-                    ctx.CSSetShaderResources(0, srvs);
+                    ctx.CSSetShaderResources(0, Some(srvs));
                 }
                 if !cbufs.is_empty() {
-                    ctx.CSSetConstantBuffers(0, cbufs);
+                    ctx.CSSetConstantBuffers(0, Some(cbufs));
                 }
                 ctx.Dispatch(groups_x, groups_y, 1);
 
@@ -790,9 +790,9 @@ mod dx11_impl {
                 let null_uavs: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
                 let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
                 let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
-                ctx.CSSetUnorderedAccessViews(0, &null_uavs, None);
-                ctx.CSSetShaderResources(0, &null_srvs);
-                ctx.CSSetConstantBuffers(0, &null_cbufs);
+                ctx.CSSetUnorderedAccessViews(0, null_uavs.len() as u32, Some(null_uavs.as_ptr() as *const _), None);
+                ctx.CSSetShaderResources(0, Some(&null_srvs));
+                ctx.CSSetConstantBuffers(0, Some(&null_cbufs));
             }
         }
 
@@ -856,10 +856,10 @@ mod dx11_impl {
                 // Pixel shader
                 ctx.PSSetShader(&pipeline.ps, None);
                 if !pixel_srvs.is_empty() {
-                    ctx.PSSetShaderResources(0, pixel_srvs);
+                    ctx.PSSetShaderResources(0, Some(pixel_srvs));
                 }
                 if !pixel_cbufs.is_empty() {
-                    ctx.PSSetConstantBuffers(0, pixel_cbufs);
+                    ctx.PSSetConstantBuffers(0, Some(pixel_cbufs));
                 }
                 ctx.PSSetSamplers(0, Some(&[Some(pipeline.sampler.clone())]));
 
@@ -873,9 +873,9 @@ mod dx11_impl {
                 let null_rtvs: [Option<ID3D11RenderTargetView>; 1] = Default::default();
                 ctx.OMSetRenderTargets(Some(&null_rtvs), None);
                 let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
-                ctx.PSSetShaderResources(0, &null_srvs);
+                ctx.PSSetShaderResources(0, Some(&null_srvs));
                 let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
-                ctx.PSSetConstantBuffers(0, &null_cbufs);
+                ctx.PSSetConstantBuffers(0, Some(&null_cbufs));
             }
 
             Ok(())
