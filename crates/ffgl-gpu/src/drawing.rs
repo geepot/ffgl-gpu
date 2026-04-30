@@ -11,20 +11,34 @@
 //! Thread-local state ensures multi-instance safety when an FFGL host calls
 //! different plugin instances from the same thread.
 
-use crate::context::GpuContext;
-use crate::plugin::{DrawInput, GpuPlugin};
+// `GpuPlugin` is referenced at module level by `draw_gpu_effect<P: GpuPlugin>`
+// so it stays ungated. Everything else is only used inside the cfg-gated
+// `metal_draw` / `dx11_draw` submodules below; gate those imports so they
+// don't warn-as-unused on a non-mac, non-windows host build (e.g. the
+// Linux Docker container compiling ffgl-gpu as a build-dep).
+use crate::plugin::GpuPlugin;
 use ffgl_core::inputs::GLInput;
 use ffgl_core::FFGLData;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::context::GpuContext;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::plugin::DrawInput;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use gl::types::{GLenum, GLint, GLuint};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use gpu_interop::GpuBridge as _;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::cell::RefCell;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tracing::error;
 
 // ---------------------------------------------------------------------------
 // GL state save / restore
 // ---------------------------------------------------------------------------
 
-/// Saved GL state that we restore after our raw GL operations.
+/// Saved GL state that we restore after our raw GL operations. Only used
+/// from the cfg-gated `metal_draw` / `dx11_draw` submodules below.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct SavedGlState {
     pack_buffer: GLint,
     unpack_buffer: GLint,
@@ -37,6 +51,7 @@ struct SavedGlState {
     viewport: [GLint; 4],
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl SavedGlState {
     unsafe fn save() -> Self {
         let mut s = Self {

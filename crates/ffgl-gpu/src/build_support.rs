@@ -37,6 +37,11 @@
 //! let compute_shader = ffgl_gpu::include_hlsl_shader!("compute");
 //! ```
 
+// Used by both `compile_metal_shaders` (macOS) and `compile_hlsl_shaders`
+// (Windows), both of which are cfg-gated. Match the cfg here so we don't
+// trigger an unused-import warning when ffgl-gpu is built as a build-dep
+// on a Linux host (e.g. Docker cross-compile container).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::path::Path;
 
 /// Compile Metal shaders from a directory.

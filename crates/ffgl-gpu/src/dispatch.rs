@@ -3,10 +3,16 @@
 //!
 //! All pipeline creation and dispatch methods live on [`GpuContext`].
 
-use anyhow::Result;
-
 use crate::buffer::GpuBuffer;
+
+// Used only by the cfg-gated `metal_impl` / `dx11_impl` modules below;
+// gate to match so they don't warn-as-unused on a non-mac, non-windows
+// host build.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use anyhow::Result;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::context::GpuContext;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::pipeline::{ComputePipeline, RenderPipeline};
 
 // ---------------------------------------------------------------------------
