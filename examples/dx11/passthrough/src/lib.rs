@@ -62,6 +62,7 @@ impl GpuPlugin for GpuState {
                 &[Some(input.output_uav.clone())],
                 &[Some(input.input_srv.clone())],
                 &[],
+                &[],
                 (input.width as usize, input.height as usize),
                 (16, 16),
             );

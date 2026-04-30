@@ -98,6 +98,7 @@ mod metal_impl {
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         pipeline: &ComputePipeline,
         textures: &[&ProtocolObject<dyn MTLTexture>],
+        samplers: &[&ProtocolObject<dyn MTLSamplerState>],
         buffers: &[(&GpuBuffer, usize)],
         bytes: &[(&[u8], usize)],
         grid: (usize, usize),
@@ -108,6 +109,12 @@ mod metal_impl {
         for (i, tex) in textures.iter().enumerate() {
             unsafe {
                 encoder.setTexture_atIndex(Some(*tex), i);
+            }
+        }
+
+        for (i, samp) in samplers.iter().enumerate() {
+            unsafe {
+                encoder.setSamplerState_atIndex(Some(*samp), i);
             }
         }
 
@@ -282,12 +289,13 @@ mod metal_impl {
         /// the pipeline with all bindings, dispatch, commit, and return a
         /// [`PendingWork`] token.
         ///
-        /// Textures are bound sequentially starting at index 0. Buffers and
-        /// bytes are bound at their specified slot indices.
+        /// Textures and samplers are bound sequentially starting at index 0.
+        /// Buffers and bytes are bound at their specified slot indices.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
             textures: &[&ProtocolObject<dyn MTLTexture>],
+            samplers: &[&ProtocolObject<dyn MTLSamplerState>],
             buffers: &[(&GpuBuffer, usize)],
             bytes: &[(&[u8], usize)],
             grid: (usize, usize),
@@ -304,7 +312,7 @@ mod metal_impl {
                 .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
 
             encode_compute_inner(
-                &encoder, pipeline, textures, buffers, bytes, grid, threadgroup,
+                &encoder, pipeline, textures, samplers, buffers, bytes, grid, threadgroup,
             );
 
             command_buffer.commit();
@@ -409,13 +417,14 @@ mod metal_impl {
         /// targets the given [`CommandBuffer`] instead of creating a new one.
         /// Call [`commit`](Self::commit) after encoding all passes.
         ///
-        /// Textures are bound sequentially starting at index 0. Buffers and
-        /// bytes are bound at their specified slot indices.
+        /// Textures and samplers are bound sequentially starting at index 0.
+        /// Buffers and bytes are bound at their specified slot indices.
         pub fn encode_compute_pass(
             &self,
             cb: &CommandBuffer,
             pipeline: &ComputePipeline,
             textures: &[&ProtocolObject<dyn MTLTexture>],
+            samplers: &[&ProtocolObject<dyn MTLSamplerState>],
             buffers: &[(&GpuBuffer, usize)],
             bytes: &[(&[u8], usize)],
             grid: (usize, usize),
@@ -427,10 +436,31 @@ mod metal_impl {
                 .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
 
             encode_compute_inner(
-                &encoder, pipeline, textures, buffers, bytes, grid, threadgroup,
+                &encoder, pipeline, textures, samplers, buffers, bytes, grid, threadgroup,
             );
 
             Ok(())
+        }
+
+        /// Create a Metal sampler state with linear filtering and clamp-to-edge
+        /// addressing — the standard "bilinear sampler" used by image-processing
+        /// compute kernels. Returns a `Retained<...>` that owns one ref count;
+        /// keep it alive (e.g. on the plugin instance) for as long as you want
+        /// to dispatch with it bound.
+        pub fn create_linear_clamp_sampler(
+            &self,
+        ) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLSamplerState>>> {
+            let desc = MTLSamplerDescriptor::new();
+            desc.setMinFilter(MTLSamplerMinMagFilter::Linear);
+            desc.setMagFilter(MTLSamplerMinMagFilter::Linear);
+            desc.setMipFilter(MTLSamplerMipFilter::NotMipmapped);
+            desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+            desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
+            desc.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
+            self.device
+                .device()
+                .newSamplerStateWithDescriptor(&desc)
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal sampler state"))
         }
 
         /// Encode a fullscreen render pass on an existing command buffer.
@@ -755,15 +785,17 @@ mod dx11_impl {
 
         /// Dispatch a compute shader on the immediate context.
         ///
-        /// Binds the compute shader, UAVs, SRVs, and constant buffers, then
-        /// dispatches enough thread groups to cover `grid` total threads with
-        /// the given `threadgroup` size. Unbinds all CS resources after dispatch
-        /// to prevent resource hazards in multi-pass scenarios.
+        /// Binds the compute shader, UAVs, SRVs, samplers, and constant
+        /// buffers, then dispatches enough thread groups to cover `grid`
+        /// total threads with the given `threadgroup` size. Unbinds all CS
+        /// resources after dispatch to prevent resource hazards in
+        /// multi-pass scenarios.
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
             uavs: &[Option<ID3D11UnorderedAccessView>],
             srvs: &[Option<ID3D11ShaderResourceView>],
+            samplers: &[Option<ID3D11SamplerState>],
             cbufs: &[Option<ID3D11Buffer>],
             grid: (usize, usize),
             threadgroup: (usize, usize),
@@ -775,10 +807,18 @@ mod dx11_impl {
             unsafe {
                 ctx.CSSetShader(&pipeline.shader, None);
                 if !uavs.is_empty() {
-                    ctx.CSSetUnorderedAccessViews(0, uavs.len() as u32, Some(uavs.as_ptr() as *const _), None);
+                    ctx.CSSetUnorderedAccessViews(
+                        0,
+                        uavs.len() as u32,
+                        Some(uavs.as_ptr()),
+                        None,
+                    );
                 }
                 if !srvs.is_empty() {
                     ctx.CSSetShaderResources(0, Some(srvs));
+                }
+                if !samplers.is_empty() {
+                    ctx.CSSetSamplers(0, Some(samplers));
                 }
                 if !cbufs.is_empty() {
                     ctx.CSSetConstantBuffers(0, Some(cbufs));
@@ -789,11 +829,42 @@ mod dx11_impl {
                 // texture is used as SRV in a subsequent pass.
                 let null_uavs: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
                 let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
+                let null_samplers: [Option<ID3D11SamplerState>; 4] = Default::default();
                 let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
-                ctx.CSSetUnorderedAccessViews(0, null_uavs.len() as u32, Some(null_uavs.as_ptr() as *const _), None);
+                ctx.CSSetUnorderedAccessViews(
+                    0,
+                    null_uavs.len() as u32,
+                    Some(null_uavs.as_ptr()),
+                    None,
+                );
                 ctx.CSSetShaderResources(0, Some(&null_srvs));
+                ctx.CSSetSamplers(0, Some(&null_samplers));
                 ctx.CSSetConstantBuffers(0, Some(&null_cbufs));
             }
+        }
+
+        /// Create a D3D11 sampler with linear filtering and clamp addressing.
+        pub fn create_linear_clamp_sampler(&self) -> Result<ID3D11SamplerState> {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+            };
+            let mut sampler = None;
+            unsafe {
+                self.device
+                    .device()
+                    .CreateSamplerState(&desc, Some(&mut sampler))
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to create D3D11 sampler: {e}"))?;
+            sampler.ok_or_else(|| anyhow::anyhow!("CreateSamplerState returned null"))
         }
 
         /// Dispatch a fullscreen render pass using the given render pipeline.
