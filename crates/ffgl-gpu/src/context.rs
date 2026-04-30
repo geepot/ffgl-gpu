@@ -4,6 +4,10 @@
 //! compiled Metal shader library. On Windows it holds a [`Dx11Device`] (shaders
 //! are loaded individually per-pipeline from bytecode).
 
+// Used only by the cfg-gated `new()` impls below; gate to match so the
+// import doesn't warn-as-unused on a non-mac, non-windows host build
+// (e.g. the Linux Docker container compiling ffgl-gpu as a build-dep).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use anyhow::Result;
 
 #[cfg(target_os = "macos")]
