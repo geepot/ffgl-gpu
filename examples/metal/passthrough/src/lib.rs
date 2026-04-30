@@ -53,6 +53,7 @@ impl GpuPlugin for GpuState {
                 &[input.input, input.output],
                 &[],
                 &[],
+                &[],
                 (input.width as usize, input.height as usize),
                 (16, 16),
             ) {

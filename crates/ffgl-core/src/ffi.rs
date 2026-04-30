@@ -279,6 +279,23 @@ pub struct SetParameterElementValueStruct {
     pub NewParameterValue: FFMixed,
 }
 
+/// A single parameter event (param index + event flags).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ParamEventStruct {
+    pub ParameterNumber: u32,
+    pub eventFlags: u64,
+}
+
+/// Struct passed to the plugin for GetParameterEvents.
+/// `numEvents` is the max on input and actual count on output.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GetParamEventsStruct {
+    pub numEvents: u32,
+    pub events: *mut ParamEventStruct,
+}
+
 // =====================================================================
 // Utility
 // =====================================================================

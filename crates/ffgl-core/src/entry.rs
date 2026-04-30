@@ -328,6 +328,25 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
 
         Op::Connect => SuccessVal::Success.into(),
 
+        Op::GetParameterEvents => {
+            let events_struct: &mut GetParamEventsStruct =
+                unsafe { (input_value).as_mut() };
+            let max = events_struct.numEvents as usize;
+            let events = instance
+                .context(e!("No instance"))?
+                .renderer
+                .consume_param_events(max);
+            let buf = events_struct.events;
+            for (i, (param_num, flags)) in events.iter().enumerate() {
+                unsafe {
+                    (*buf.add(i)).ParameterNumber = *param_num;
+                    (*buf.add(i)).eventFlags = *flags;
+                }
+            }
+            events_struct.numEvents = events.len() as u32;
+            SuccessVal::Success.into()
+        }
+
         Op::Instantiate | Op::Deinstantiate | Op::ProcessFrame | Op::ProcessFrameCopy => {
             SuccessVal::Fail.into()
         }
