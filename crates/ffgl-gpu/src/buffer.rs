@@ -24,11 +24,11 @@ pub struct GpuBuffer {
     pub(crate) metal: Retained<ProtocolObject<dyn MTLBuffer>>,
 
     #[cfg(target_os = "windows")]
-    pub(crate) dx11_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
+    pub dx11_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
     #[cfg(target_os = "windows")]
-    pub(crate) dx11_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
+    pub dx11_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
     #[cfg(target_os = "windows")]
-    pub(crate) dx11_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    pub dx11_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
 }
 
 impl GpuBuffer {
@@ -41,23 +41,5 @@ impl GpuBuffer {
     #[cfg(target_os = "macos")]
     pub fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.metal
-    }
-
-    /// Borrow the underlying DX11 buffer (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn dx11_buffer(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Buffer {
-        &self.dx11_buffer
-    }
-
-    /// Borrow the DX11 unordered access view (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn dx11_uav(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView {
-        &self.dx11_uav
-    }
-
-    /// Borrow the DX11 shader resource view (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn dx11_srv(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView {
-        &self.dx11_srv
     }
 }
