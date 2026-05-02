@@ -81,7 +81,7 @@ impl GpuState {
         desc.setStorageMode(MTLStorageMode::Private);
         desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
 
-        self.intermediate_texture = ctx.metal_device().device().newTextureWithDescriptor(&desc);
+        self.intermediate_texture = ctx.device.device().newTextureWithDescriptor(&desc);
         self.intermediate_dims = (width, height);
     }
 }

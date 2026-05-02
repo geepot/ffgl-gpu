@@ -138,7 +138,7 @@ impl GpuState {
             }
             desc.setStorageMode(MTLStorageMode::Private);
             desc.setUsage(usage);
-            ctx.metal_device().device().newTextureWithDescriptor(&desc)
+            ctx.device.device().newTextureWithDescriptor(&desc)
         };
 
         // After grayscale: read by tint fragment + written by compute

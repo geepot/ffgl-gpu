@@ -24,12 +24,12 @@ use objc2_metal::MTLLibrary;
 /// individually per-pipeline from compiled bytecode (`.cso`).
 pub struct GpuContext {
     #[cfg(target_os = "macos")]
-    pub(crate) device: gpu_interop::metal::MetalDevice,
+    pub device: gpu_interop::metal::MetalDevice,
     #[cfg(target_os = "macos")]
-    pub(crate) library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    pub library: Retained<ProtocolObject<dyn MTLLibrary>>,
 
     #[cfg(target_os = "windows")]
-    pub(crate) device: gpu_interop::dx11::Dx11Device,
+    pub device: gpu_interop::dx11::Dx11Device,
 }
 
 impl GpuContext {
@@ -65,21 +65,4 @@ impl GpuContext {
         Ok(Self { device })
     }
 
-    /// Borrow the underlying Metal device (macOS).
-    #[cfg(target_os = "macos")]
-    pub fn metal_device(&self) -> &gpu_interop::metal::MetalDevice {
-        &self.device
-    }
-
-    /// Borrow the Metal shader library (macOS).
-    #[cfg(target_os = "macos")]
-    pub fn metal_library(&self) -> &ProtocolObject<dyn MTLLibrary> {
-        &self.library
-    }
-
-    /// Borrow the underlying DX11 device (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn dx11_device(&self) -> &gpu_interop::dx11::Dx11Device {
-        &self.device
-    }
 }

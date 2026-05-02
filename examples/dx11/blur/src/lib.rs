@@ -205,7 +205,7 @@ impl GpuPlugin for GpuState {
             self.h_pipeline = Some(ctx.create_compute_pipeline(H_SHADER)?);
             self.v_pipeline = Some(ctx.create_compute_pipeline(V_SHADER)?);
             self.cbuf = gpu_interop::dx11::create_dynamic_cbuf(
-                ctx.dx11_device().device(),
+                ctx.device.device(),
                 std::mem::size_of::<BlurParams>(),
             );
         }

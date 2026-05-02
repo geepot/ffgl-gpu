@@ -18,10 +18,10 @@ use objc2_metal::MTLBuffer;
 /// access in compute shaders.
 pub struct GpuBuffer {
     /// Total size in bytes.
-    pub(crate) size: usize,
+    pub size: usize,
 
     #[cfg(target_os = "macos")]
-    pub(crate) metal: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub metal: Retained<ProtocolObject<dyn MTLBuffer>>,
 
     #[cfg(target_os = "windows")]
     pub dx11_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Buffer,
@@ -29,17 +29,4 @@ pub struct GpuBuffer {
     pub dx11_uav: windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView,
     #[cfg(target_os = "windows")]
     pub dx11_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
-}
-
-impl GpuBuffer {
-    /// Total size of this buffer in bytes.
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Borrow the underlying Metal buffer (macOS).
-    #[cfg(target_os = "macos")]
-    pub fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.metal
-    }
 }

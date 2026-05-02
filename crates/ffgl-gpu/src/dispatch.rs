@@ -11,6 +11,8 @@ use crate::buffer::GpuBuffer;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use anyhow::Result;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::bind_set::BindSet;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::context::GpuContext;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::pipeline::{ComputePipeline, RenderPipeline};
@@ -100,6 +102,14 @@ mod metal_impl {
 
     /// Encode a compute dispatch onto `encoder`: set pipeline, bind resources,
     /// dispatch threads, and end the encoder.
+    //
+    // SAFETY: All `encoder.set*` calls below are `unsafe` because objc2 marks
+    // every method on its protocol-object wrappers as unsafe (the FFI
+    // boundary). The Rust-side invariants — that the texture/sampler/buffer
+    // is non-null and lives at least as long as the encoder — are upheld
+    // because `&'a T` borrows guarantee non-null + outlives-this-call. The
+    // one genuinely interesting cast is the `setBytes` block: see the
+    // SAFETY comment above that loop.
     fn encode_compute_inner(
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         pipeline: &ComputePipeline,
@@ -130,6 +140,16 @@ mod metal_impl {
             }
         }
 
+        // SAFETY: `setBytes_length_atIndex` takes a `*mut c_void` purely
+        // because the Objective-C selector is non-const-qualified on the
+        // pointer parameter; semantically the API is read-only — Metal
+        // copies `length` bytes out of the pointer before returning, and
+        // the encoder never retains the pointer past this call. So the
+        // immutable-to-mutable cast (`as *mut _`) does not enable any
+        // actual mutation. `NonNull::new_unchecked` is sound because
+        // `data.as_ptr()` for a `&[u8]` is always non-null (slices
+        // always reference at least one well-aligned byte, even when
+        // empty).
         for (data, idx) in bytes {
             unsafe {
                 encoder.setBytes_length_atIndex(
@@ -150,6 +170,79 @@ mod metal_impl {
             height: threadgroup.1,
             depth: 1,
         };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
+        encoder.endEncoding();
+    }
+
+    /// Encode a BindSet onto `encoder` then dispatch and end. Slot-aware:
+    /// every binding lands at the slot the caller specified, including
+    /// sparse slots (e.g. binding 7 with nothing at 0..6).
+    //
+    // SAFETY: same overall invariants as `encode_compute_inner`. Each
+    // `encoder.set*_atIndex` call is FFI-unsafe but receives a non-null
+    // borrowed reference whose lifetime outlives the encoder (enforced by
+    // BindSet's lifetime parameter). The `setBytes` loop reuses the
+    // immutable-to-mutable cast pattern justified there.
+    fn encode_bind_set(
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pipeline: &ComputePipeline,
+        bindings: &BindSet<'_>,
+        grid: (usize, usize),
+        threadgroup: (usize, usize),
+    ) {
+        encoder.setComputePipelineState(&pipeline.state);
+
+        // Metal does not have a separate UAV register class — both
+        // `texture_read` and `texture_rw` map to the same texture-slot
+        // space. Bind both tables; if the WGSL author used the same
+        // slot for both, the rw view wins (last-set).
+        for (slot, tex) in bindings.textures_ro.iter().enumerate() {
+            if let Some(t) = tex {
+                unsafe { encoder.setTexture_atIndex(Some(*t), slot); }
+            }
+        }
+        for (slot, tex) in bindings.textures_rw.iter().enumerate() {
+            if let Some(t) = tex {
+                unsafe { encoder.setTexture_atIndex(Some(*t), slot); }
+            }
+        }
+
+        for (slot, samp) in bindings.samplers.iter().enumerate() {
+            if let Some(s) = samp {
+                unsafe { encoder.setSamplerState_atIndex(Some(*s), slot); }
+            }
+        }
+
+        // Metal unifies storage buffers and uniform buffers into a
+        // single `[[buffer(N)]]` slot space — buffers_ro, buffers_rw,
+        // and uniforms all bind via setBuffer/setBytes at their slot.
+        for (slot, buf) in bindings.buffers_ro.iter().enumerate() {
+            if let Some(b) = buf {
+                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.metal), 0, slot); }
+            }
+        }
+        for (slot, buf) in bindings.buffers_rw.iter().enumerate() {
+            if let Some(b) = buf {
+                unsafe { encoder.setBuffer_offset_atIndex(Some(&b.metal), 0, slot); }
+            }
+        }
+
+        // SAFETY: see `encode_compute_inner` — `setBytes_length_atIndex`
+        // copies before returning, immutable cast is sound.
+        for (slot, data) in bindings.uniforms.iter().enumerate() {
+            if let Some(d) = data {
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        std::ptr::NonNull::new_unchecked(d.as_ptr() as *mut _),
+                        d.len(),
+                        slot,
+                    );
+                }
+            }
+        }
+
+        let grid_size = MTLSize { width: grid.0, height: grid.1, depth: 1 };
+        let tg_size = MTLSize { width: threadgroup.0, height: threadgroup.1, depth: 1 };
         encoder.dispatchThreads_threadsPerThreadgroup(grid_size, tg_size);
         encoder.endEncoding();
     }
@@ -205,6 +298,12 @@ mod metal_impl {
             desc.setFragmentFunction(Some(&fs_func));
 
             {
+                // SAFETY: `colorAttachments()` returns a non-null
+                // `MTLRenderPipelineColorAttachmentDescriptorArray` per
+                // MTLRenderPipelineDescriptor invariants, and slot 0 is
+                // always valid (the array is allocated to its declared
+                // capacity). `objectAtIndexedSubscript` is unsafe purely
+                // because objc2 marks it so for FFI hygiene.
                 let attachment = unsafe {
                     desc.colorAttachments().objectAtIndexedSubscript(0)
                 };
@@ -222,7 +321,14 @@ mod metal_impl {
                     )
                 })?;
 
-            // Create fullscreen quad vertex buffer
+            // Create fullscreen quad vertex buffer.
+            //
+            // SAFETY: `newBufferWithBytes_length_options` copies `quad_len`
+            // bytes from the source pointer into a fresh GPU-resident
+            // buffer before returning, so the immutable-to-mutable cast
+            // does not enable any actual mutation. `NonNull::new_unchecked`
+            // is sound because `quad_data.as_ptr()` references a non-null
+            // stack-allocated `[[f32; 4]; 4]`.
             let quad_data = FULLSCREEN_QUAD;
             let quad_bytes = quad_data.as_ptr() as *const std::ffi::c_void;
             let quad_len = std::mem::size_of_val(&quad_data);
@@ -297,6 +403,7 @@ mod metal_impl {
         ///
         /// Textures and samplers are bound sequentially starting at index 0.
         /// Buffers and bytes are bound at their specified slot indices.
+        #[allow(clippy::too_many_arguments)]
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
@@ -343,6 +450,13 @@ mod metal_impl {
                 .commandBuffer()
                 .ok_or_else(|| anyhow::anyhow!("Failed to create command buffer for render"))?;
 
+            // SAFETY: each `encoder.set*` / `colorAttachments` /
+            // `drawPrimitives` call is FFI-unsafe per objc2 conventions,
+            // not memory-unsafe. Borrowed references guarantee non-null +
+            // outlive-this-call. The `setFragmentBytes` cast follows the
+            // same justification as `encode_compute_inner`'s setBytes
+            // loop: Metal copies before returning, immutable-to-mutable
+            // cast is sound.
             let render_desc = MTLRenderPassDescriptor::new();
             {
                 let attachment = unsafe {
@@ -425,6 +539,7 @@ mod metal_impl {
         ///
         /// Textures and samplers are bound sequentially starting at index 0.
         /// Buffers and bytes are bound at their specified slot indices.
+        #[allow(clippy::too_many_arguments)]
         pub fn encode_compute_pass(
             &self,
             cb: &CommandBuffer,
@@ -444,6 +559,57 @@ mod metal_impl {
             encode_compute_inner(
                 &encoder, pipeline, textures, samplers, buffers, bytes, grid, threadgroup,
             );
+
+            Ok(())
+        }
+
+        /// Dispatch a compute pass using a [`BindSet`] for resource
+        /// binding. Slot-aware on both texture and buffer indices, and
+        /// hides the platform asymmetry between Metal's sequential
+        /// bindings and DX11's parallel slot arrays.
+        ///
+        /// Same submission semantics as [`dispatch_compute`](Self::dispatch_compute).
+        pub fn dispatch_compute_with(
+            &self,
+            pipeline: &ComputePipeline,
+            bindings: &BindSet<'_>,
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) -> Result<PendingWork> {
+            let command_buffer = self
+                .device
+                .command_queue()
+                .commandBuffer()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal command buffer"))?;
+
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
+
+            encode_bind_set(&encoder, pipeline, bindings, grid, threadgroup);
+
+            command_buffer.commit();
+            Ok(PendingWork { command_buffer })
+        }
+
+        /// Encode a compute pass on an existing command buffer using a
+        /// [`BindSet`] for resource binding. Same as
+        /// [`encode_compute_pass`](Self::encode_compute_pass) but with
+        /// the unified bind-set API.
+        pub fn encode_compute_pass_with(
+            &self,
+            cb: &CommandBuffer,
+            pipeline: &ComputePipeline,
+            bindings: &BindSet<'_>,
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) -> Result<()> {
+            let encoder = cb
+                .inner
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow::anyhow!("Failed to create Metal compute encoder"))?;
+
+            encode_bind_set(&encoder, pipeline, bindings, grid, threadgroup);
 
             Ok(())
         }
@@ -482,6 +648,8 @@ mod metal_impl {
             fragment_textures: &[&ProtocolObject<dyn MTLTexture>],
             fragment_bytes: &[(&[u8], usize)],
         ) -> Result<()> {
+            // SAFETY: every objc2 call below is FFI-unsafe rather than
+            // memory-unsafe; same invariants as `dispatch_render` apply.
             let render_desc = MTLRenderPassDescriptor::new();
             {
                 let attachment = unsafe {
@@ -796,6 +964,7 @@ mod dx11_impl {
         /// total threads with the given `threadgroup` size. Unbinds all CS
         /// resources after dispatch to prevent resource hazards in
         /// multi-pass scenarios.
+        #[allow(clippy::too_many_arguments)]
         pub fn dispatch_compute(
             &self,
             pipeline: &ComputePipeline,
@@ -849,6 +1018,51 @@ mod dx11_impl {
             }
         }
 
+        /// Dispatch a compute shader using a [`BindSet`] for resource
+        /// binding. Same submission semantics as
+        /// [`dispatch_compute`](Self::dispatch_compute) but the
+        /// platform-specific UAV/SRV slot packing happens internally.
+        pub fn dispatch_compute_with(
+            &self,
+            pipeline: &ComputePipeline,
+            bindings: &BindSet<'_>,
+            grid: (usize, usize),
+            threadgroup: (usize, usize),
+        ) {
+            // Pack BindSet's sparse tables into the dense `Vec<Option<View>>`
+            // form CSSet*(0, ...) expects. Slot indexes are preserved one-to-one;
+            // unset slots become `None`.
+            let uav_len = bindings.textures_rw.len().max(bindings.buffers_rw.len());
+            let mut uavs: Vec<Option<ID3D11UnorderedAccessView>> = vec![None; uav_len];
+            for (slot, tex) in bindings.textures_rw.iter().enumerate() {
+                if let Some(t) = tex { uavs[slot] = Some((*t).clone()); }
+            }
+            for (slot, buf) in bindings.buffers_rw.iter().enumerate() {
+                if let Some(b) = buf { uavs[slot] = Some(b.dx11_uav.clone()); }
+            }
+
+            let srv_len = bindings.textures_ro.len().max(bindings.buffers_ro.len());
+            let mut srvs: Vec<Option<ID3D11ShaderResourceView>> = vec![None; srv_len];
+            for (slot, tex) in bindings.textures_ro.iter().enumerate() {
+                if let Some(t) = tex { srvs[slot] = Some((*t).clone()); }
+            }
+            for (slot, buf) in bindings.buffers_ro.iter().enumerate() {
+                if let Some(b) = buf { srvs[slot] = Some(b.dx11_srv.clone()); }
+            }
+
+            let mut samplers: Vec<Option<ID3D11SamplerState>> = vec![None; bindings.samplers.len()];
+            for (slot, samp) in bindings.samplers.iter().enumerate() {
+                if let Some(s) = samp { samplers[slot] = Some((*s).clone()); }
+            }
+
+            let mut cbufs: Vec<Option<ID3D11Buffer>> = vec![None; bindings.uniforms.len()];
+            for (slot, cb) in bindings.uniforms.iter().enumerate() {
+                if let Some(b) = cb { cbufs[slot] = Some((*b).clone()); }
+            }
+
+            self.dispatch_compute(pipeline, &uavs, &srvs, &samplers, &cbufs, grid, threadgroup);
+        }
+
         /// Create a D3D11 sampler with linear filtering and clamp addressing.
         pub fn create_linear_clamp_sampler(&self) -> Result<ID3D11SamplerState> {
             let desc = D3D11_SAMPLER_DESC {
@@ -878,6 +1092,7 @@ mod dx11_impl {
         /// Creates a temporary render target view from `output_texture`, sets
         /// up the viewport, draws a fullscreen quad, and unbinds all resources
         /// afterward to prevent hazards.
+        #[allow(clippy::too_many_arguments)]
         pub fn dispatch_render(
             &self,
             pipeline: &RenderPipeline,

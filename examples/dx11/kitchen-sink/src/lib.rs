@@ -176,7 +176,7 @@ impl GpuState {
             return;
         }
 
-        let device = ctx.dx11_device().device();
+        let device = ctx.device.device();
 
         // --- tex_after_grayscale: SRV + UAV (compute write, render read) ---
         {
@@ -311,7 +311,7 @@ impl GpuPlugin for GpuState {
             self.tint_pipeline = Some(ctx.create_render_pipeline(TINT_VS, TINT_PS)?);
             self.blend_pipeline = Some(ctx.create_compute_pipeline(BLEND_CS)?);
             self.cbuf = gpu_interop::dx11::create_dynamic_cbuf(
-                ctx.dx11_device().device(),
+                ctx.device.device(),
                 std::mem::size_of::<EffectParams>(),
             );
         }

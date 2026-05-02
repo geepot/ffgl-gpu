@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 //! High-level FFGL GPU plugin framework.
 //!
 //! This crate ties together [`ffgl_core`] (host protocol), [`ffgl_glium`]
@@ -23,6 +21,7 @@
 //! load the compiled shaders with [`include_metallib!`] and
 //! [`include_hlsl_shader!`].
 
+pub mod bind_set;
 pub mod buffer;
 pub mod build_support;
 pub mod bytes;
@@ -33,6 +32,7 @@ pub mod pipeline;
 pub mod plugin;
 
 // Re-export primary types at crate root for convenience.
+pub use bind_set::{BindError, BindSet, SamplerRef, TextureRead, TextureRw, UniformsBinding};
 pub use buffer::GpuBuffer;
 pub use bytes::AsBytes;
 pub use context::GpuContext;
