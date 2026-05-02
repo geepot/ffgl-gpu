@@ -18,23 +18,6 @@ use crate::context::GpuContext;
 use crate::pipeline::{ComputePipeline, RenderPipeline};
 
 // ---------------------------------------------------------------------------
-// Binding enum — platform-agnostic resource binding descriptor
-// ---------------------------------------------------------------------------
-
-/// A resource to bind at a numbered slot when dispatching a compute or render
-/// pipeline.
-pub enum Binding<'a> {
-    /// A GPU buffer.
-    Buffer(&'a GpuBuffer),
-    /// A platform-specific texture. On macOS this is a `&ProtocolObject<dyn
-    /// MTLTexture>`; on Windows an `&ID3D11ShaderResourceView` or
-    /// `&ID3D11UnorderedAccessView`. The caller must cast via `Any`.
-    Texture(&'a dyn std::any::Any),
-    /// Inline uniform / constant data (copied into the command encoder).
-    UniformData(&'a [u8]),
-}
-
-// ---------------------------------------------------------------------------
 // Compute pass — in-progress compute encoding
 // ---------------------------------------------------------------------------
 
@@ -403,6 +386,10 @@ mod metal_impl {
         ///
         /// Textures and samplers are bound sequentially starting at index 0.
         /// Buffers and bytes are bound at their specified slot indices.
+        #[deprecated(
+            note = "use dispatch_compute_with(&BindSet) — slot-aware bindings, \
+                    HLSL register-class collision detection, no parallel-array ceremony"
+        )]
         #[allow(clippy::too_many_arguments)]
         pub fn dispatch_compute(
             &self,
@@ -539,6 +526,10 @@ mod metal_impl {
         ///
         /// Textures and samplers are bound sequentially starting at index 0.
         /// Buffers and bytes are bound at their specified slot indices.
+        #[deprecated(
+            note = "use encode_compute_pass_with(cb, pipeline, &BindSet, ...) — \
+                    slot-aware bindings, HLSL register-class collision detection"
+        )]
         #[allow(clippy::too_many_arguments)]
         pub fn encode_compute_pass(
             &self,
@@ -964,6 +955,10 @@ mod dx11_impl {
         /// total threads with the given `threadgroup` size. Unbinds all CS
         /// resources after dispatch to prevent resource hazards in
         /// multi-pass scenarios.
+        #[deprecated(
+            note = "use dispatch_compute_with(&BindSet) — slot-aware bindings, \
+                    HLSL register-class collision detection, no manual UAV/SRV padding"
+        )]
         #[allow(clippy::too_many_arguments)]
         pub fn dispatch_compute(
             &self,
@@ -1060,6 +1055,9 @@ mod dx11_impl {
                 if let Some(b) = cb { cbufs[slot] = Some((*b).clone()); }
             }
 
+            // Internal use of the deprecated entry-point — `BindSet` flattens
+            // to its parallel-array shape and we just hand them off.
+            #[allow(deprecated)]
             self.dispatch_compute(pipeline, &uavs, &srvs, &samplers, &cbufs, grid, threadgroup);
         }
 
