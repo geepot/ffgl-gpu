@@ -277,7 +277,11 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
                     std::str::from_utf8(&plugin_info.name).unwrap()
                 ))?;
 
-            let inst = handler::Instance { data, renderer };
+            let inst = handler::Instance {
+                data,
+                renderer,
+                first_events_polled: false,
+            };
 
             info!(
                 id = ?plugin_info.unique_id,
@@ -301,7 +305,7 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
         Op::ProcessOpenGL => {
             let gl_process_info: &ProcessOpenGLStruct = unsafe { input_value.as_ref() };
 
-            let handler::Instance { data, renderer } = instance.context(e!("No instance"))?;
+            let handler::Instance { data, renderer, .. } = instance.context(e!("No instance"))?;
             let gl_input = gl_process_info.into();
 
             renderer.draw(data, gl_input);
@@ -381,10 +385,34 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
             let events_struct: &mut GetParamEventsStruct =
                 unsafe { (input_value).as_mut() };
             let max = events_struct.numEvents as usize;
-            // Same pre-instance fallback as GetParameterVisibility —
-            // a pre-instance host poll just sees an empty event queue.
-            let events = match instance {
-                Some(inst) => inst.renderer.consume_param_events(max),
+            // Pre-instance poll: empty queue (no instance state exists).
+            // First post-instance poll: synthesize visibility events for
+            // every currently-hidden param. Resolume queries visibility
+            // ONCE at panel load (before instance creation), where our
+            // fallback returns "visible" — so by the time the user sees
+            // the panel after dropping the effect, hidden params would
+            // erroneously show until something else triggered a re-query.
+            // Auto-emitting on the first events poll closes that gap and
+            // works without any plugin-side opt-in.
+            let events: Vec<(u32, u64)> = match instance {
+                Some(inst) => {
+                    let mut events = Vec::new();
+                    if !inst.first_events_polled {
+                        inst.first_events_polled = true;
+                        let n = handler.num_params();
+                        for i in 0..n {
+                            if events.len() >= max { break; }
+                            if !inst.renderer.param_visible(i) {
+                                events.push((i as u32, FF_EVENT_FLAG_VISIBILITY));
+                            }
+                        }
+                    }
+                    let remaining = max.saturating_sub(events.len());
+                    if remaining > 0 {
+                        events.extend(inst.renderer.consume_param_events(remaining));
+                    }
+                    events
+                }
                 None => Vec::new(),
             };
             let buf = events_struct.events;

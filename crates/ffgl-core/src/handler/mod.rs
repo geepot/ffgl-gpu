@@ -16,6 +16,13 @@ use crate::{info, inputs::GLInput, parameters};
 pub struct Instance<T> {
     pub(crate) data: FFGLData,
     pub(crate) renderer: T,
+    /// True after the first `Op::GetParameterEvents` poll. Used by the
+    /// dispatcher in `entry.rs` to inject a one-shot batch of
+    /// visibility events for any param that's currently hidden — so
+    /// the host re-queries them once the instance exists, since its
+    /// pre-instance visibility query saw no state and got the
+    /// "default visible" fallback.
+    pub(crate) first_events_polled: bool,
 }
 
 impl<I> Debug for Instance<I> {
