@@ -36,6 +36,14 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
         panic!("No params")
     }
 
+    /// Whether the param at `index` should currently be visible in the
+    /// host's UI. Override to hide params that are irrelevant given the
+    /// current state of other params. Default: always visible. See
+    /// [`FFGLInstance::param_visible`] for the full contract.
+    fn param_visible(&self, _index: usize) -> bool {
+        true
+    }
+
     /// Consume pending parameter events. Override to push value changes to host.
     fn consume_param_events(&mut self, _max_events: usize) -> Vec<(u32, u64)> {
         vec![]
@@ -52,6 +60,10 @@ impl<T: SimpleFFGLInstance> FFGLInstance for T {
 
     fn set_param(&mut self, index: usize, value: f32) {
         SimpleFFGLInstance::set_param(self, index, value)
+    }
+
+    fn param_visible(&self, index: usize) -> bool {
+        SimpleFFGLInstance::param_visible(self, index)
     }
 
     fn consume_param_events(&mut self, max_events: usize) -> Vec<(u32, u64)> {

@@ -32,6 +32,19 @@ pub trait FFGLInstance {
     fn get_param(&self, index: usize) -> f32;
     fn set_param(&mut self, index: usize, value: f32);
 
+    /// Whether the parameter at `index` should currently be visible in
+    /// the host's UI. Override to return `false` when a param is
+    /// irrelevant given the current state of other params (e.g. hide
+    /// "High Color" when a Color Mode dropdown is set to "Solid").
+    /// Default: always visible.
+    ///
+    /// To trigger the host to re-query visibility after a state
+    /// change, push a `(param_index, FF_EVENT_FLAG_VISIBILITY)` pair
+    /// onto the event queue exposed by [`consume_param_events`].
+    fn param_visible(&self, _index: usize) -> bool {
+        true
+    }
+
     /// Consume pending parameter events. Returns (param_index, event_flags) pairs.
     /// Called by the host via GetParameterEvents. Default: no events.
     fn consume_param_events(&mut self, _max_events: usize) -> Vec<(u32, u64)> {

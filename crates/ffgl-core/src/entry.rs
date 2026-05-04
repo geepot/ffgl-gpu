@@ -328,6 +328,16 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
 
         Op::Connect => SuccessVal::Success.into(),
 
+        Op::GetParameterVisibility => {
+            let visible = instance
+                .context(e!("No instance"))?
+                .renderer
+                .param_visible(unsafe { input_value.num } as usize);
+            FFGLVal {
+                num: if visible { FF_TRUE } else { FF_FALSE },
+            }
+        }
+
         Op::GetParameterEvents => {
             let events_struct: &mut GetParamEventsStruct =
                 unsafe { (input_value).as_mut() };
