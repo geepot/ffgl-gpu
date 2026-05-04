@@ -329,10 +329,19 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
         Op::Connect => SuccessVal::Success.into(),
 
         Op::GetParameterVisibility => {
-            let visible = instance
-                .context(e!("No instance"))?
-                .renderer
-                .param_visible(unsafe { input_value.num } as usize);
+            // Resolume queries visibility while building the panel
+            // template at plugin LOAD time, before any instance has
+            // been created (`Op::InstantiateGL` only fires when the
+            // user drops the effect onto a layer). For those pre-
+            // instance queries the answer is "show everything" —
+            // anything else is per-instance state that doesn't exist
+            // yet. Returning FF_FAIL here causes Resolume to ignore
+            // every visibility hint AND log noise on every load.
+            let idx = unsafe { input_value.num } as usize;
+            let visible = match instance {
+                Some(inst) => inst.renderer.param_visible(idx),
+                None => true,
+            };
             FFGLVal {
                 num: if visible { FF_TRUE } else { FF_FALSE },
             }
@@ -342,10 +351,12 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
             let events_struct: &mut GetParamEventsStruct =
                 unsafe { (input_value).as_mut() };
             let max = events_struct.numEvents as usize;
-            let events = instance
-                .context(e!("No instance"))?
-                .renderer
-                .consume_param_events(max);
+            // Same pre-instance fallback as GetParameterVisibility —
+            // a pre-instance host poll just sees an empty event queue.
+            let events = match instance {
+                Some(inst) => inst.renderer.consume_param_events(max),
+                None => Vec::new(),
+            };
             let buf = events_struct.events;
             for (i, (param_num, flags)) in events.iter().enumerate() {
                 unsafe {
