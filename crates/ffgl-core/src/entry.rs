@@ -10,8 +10,18 @@ use crate::handler::{FFGLHandler, FFGLInstance};
 use crate::log::try_init_default_subscriber;
 use crate::parameters::ParamInfo;
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::{any::Any, ffi::CString};
+
+// Thread-local buffer for `Op::GetParameterDisplay` — the FFGL contract
+// is "return a char* the host reads synchronously, valid until the next
+// call." A single thread-local CString satisfies that on the FFGL
+// single-threaded host model. Per-call overwrite is fine because the
+// host copies the string out before issuing the next op.
+thread_local! {
+    static DISPLAY_BUFFER: RefCell<CString> = RefCell::new(CString::default());
+}
 
 use crate::conversions::*;
 
@@ -327,6 +337,26 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
         }
 
         Op::Connect => SuccessVal::Success.into(),
+
+        Op::GetParameterDisplay => {
+            // Plugins can override the host-rendered slider value via
+            // `param_display_value` to show e.g. "5.7 px" instead of
+            // the raw 0.5–16.0 internal float. None / no instance =
+            // tell the host to fall back to its own formatting.
+            let idx = unsafe { input_value.num } as usize;
+            let display = match instance {
+                Some(inst) => inst.renderer.param_display_value(idx),
+                None => None,
+            };
+            match display {
+                Some(s) => DISPLAY_BUFFER.with(|buf| {
+                    *buf.borrow_mut() = CString::new(s).unwrap_or_default();
+                    let ptr = buf.borrow().as_ptr();
+                    FFGLVal::from(ptr)
+                }),
+                None => SuccessVal::Fail.into(),
+            }
+        }
 
         Op::GetParameterVisibility => {
             // Resolume queries visibility while building the panel

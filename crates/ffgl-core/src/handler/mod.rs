@@ -45,6 +45,15 @@ pub trait FFGLInstance {
         true
     }
 
+    /// Custom-formatted display string for the parameter at `index`,
+    /// used when the host wants to render something other than the
+    /// raw float (e.g. "5.7 px" for a slider that's internally a
+    /// 0.5–16.0 pixel range). Default `None` — the host uses its
+    /// own formatting.
+    fn param_display_value(&self, _index: usize) -> Option<String> {
+        None
+    }
+
     /// Consume pending parameter events. Returns (param_index, event_flags) pairs.
     /// Called by the host via GetParameterEvents. Default: no events.
     fn consume_param_events(&mut self, _max_events: usize) -> Vec<(u32, u64)> {

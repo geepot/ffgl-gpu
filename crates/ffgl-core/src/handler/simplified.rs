@@ -44,6 +44,12 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
         true
     }
 
+    /// Custom-formatted display string for the param at `index`.
+    /// See [`FFGLInstance::param_display_value`] for details.
+    fn param_display_value(&self, _index: usize) -> Option<String> {
+        None
+    }
+
     /// Consume pending parameter events. Override to push value changes to host.
     fn consume_param_events(&mut self, _max_events: usize) -> Vec<(u32, u64)> {
         vec![]
@@ -64,6 +70,10 @@ impl<T: SimpleFFGLInstance> FFGLInstance for T {
 
     fn param_visible(&self, index: usize) -> bool {
         SimpleFFGLInstance::param_visible(self, index)
+    }
+
+    fn param_display_value(&self, index: usize) -> Option<String> {
+        SimpleFFGLInstance::param_display_value(self, index)
     }
 
     fn consume_param_events(&mut self, max_events: usize) -> Vec<(u32, u64)> {
