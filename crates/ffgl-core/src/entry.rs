@@ -366,15 +366,27 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
             // Resolume queries visibility while building the panel
             // template at plugin LOAD time, before any instance has
             // been created (`Op::InstantiateGL` only fires when the
-            // user drops the effect onto a layer). For those pre-
-            // instance queries the answer is "show everything" —
-            // anything else is per-instance state that doesn't exist
-            // yet. Returning FF_FAIL here causes Resolume to ignore
-            // every visibility hint AND log noise on every load.
+            // user drops the effect onto a layer). The host CACHES
+            // the pre-instance answer and only re-queries on
+            // FF_EVENT_FLAG_VISIBILITY events that the plugin pushes —
+            // and event draining is gated on layer rendering. So if
+            // the user drops the effect on an idle (non-playing)
+            // layer, no events will ever drain and the panel renders
+            // whatever we returned at panel build, period.
+            //
+            // Returning a static `true` for every pre-instance query
+            // means the panel always shows everything visible until
+            // the layer plays. To make the panel render correctly on
+            // idle layers (the common case for unmapped clips), the
+            // handler exposes `param_default_visible` — the plugin's
+            // visibility computation for DEFAULT param values, no
+            // instance state needed. We use that pre-instance and
+            // fall through to per-instance `param_visible` once an
+            // instance exists.
             let idx = unsafe { input_value.num } as usize;
             let visible = match instance {
                 Some(inst) => inst.renderer.param_visible(idx),
-                None => true,
+                None => handler.param_default_visible(idx),
             };
             FFGLVal {
                 num: if visible { FF_TRUE } else { FF_FALSE },

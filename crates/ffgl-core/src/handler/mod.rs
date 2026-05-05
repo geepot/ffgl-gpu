@@ -86,6 +86,19 @@ pub trait FFGLHandler: Send + Sync {
 
     fn plugin_info(&'static self) -> info::PluginInfo;
 
+    /// Visibility of the parameter at `index` for the DEFAULT parameter
+    /// state, used when the host queries `FF_GET_PRAMETER_VISIBILITY`
+    /// pre-instance (panel-template build). Resolume caches this answer
+    /// and only re-queries when an instance pushes a visibility event,
+    /// which can't happen until events get drained — and event draining
+    /// is gated on layer rendering. So returning the correct visibility
+    /// for default param values here is the only way to get a correct
+    /// initial panel on idle layers (drop effect on a layer with no
+    /// playing clip). Default: visible.
+    fn param_default_visible(&'static self, _index: usize) -> bool {
+        true
+    }
+
     fn new_instance(
         &'static self,
         inst_data: &FFGLData,

@@ -29,6 +29,15 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
 
     fn plugin_info() -> crate::info::PluginInfo;
 
+    /// Static visibility for the DEFAULT param state. See
+    /// [`FFGLHandler::param_default_visible`] for the contract — this
+    /// is what the host caches at panel-template build, and it's the
+    /// only correct way to render the panel on a layer that's not
+    /// playing anything (no rendering = no events draining).
+    fn param_default_visible(_index: usize) -> bool {
+        true
+    }
+
     fn get_param(&self, _index: usize) -> f32 {
         panic!("No params")
     }
@@ -105,6 +114,10 @@ impl<T: SimpleFFGLInstance> FFGLHandler for SimpleFFGLHandler<T> {
 
     fn plugin_info(&self) -> crate::info::PluginInfo {
         T::plugin_info()
+    }
+
+    fn param_default_visible(&'static self, index: usize) -> bool {
+        T::param_default_visible(index)
     }
 
     fn new_instance(&self, inst_data: &FFGLData) -> Result<Self::Instance, Self::NewInstanceError> {
