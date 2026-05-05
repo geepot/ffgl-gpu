@@ -388,8 +388,29 @@ impl GpuBridge for GlMetalBridge {
                     {
                         self.host_texture_type = GL_TEXTURE_RECTANGLE;
                     } else {
+                        // Probe the texture's actual properties so the
+                        // log tells us *why* the FBO was incomplete.
+                        // Most common cause for clip-source textures:
+                        // the internal format isn't color-renderable
+                        // (video decoder output is often YUV / sub-
+                        // sampled / compressed). The blit path requires
+                        // renderability of the source; if we hit this
+                        // routinely, the fix is a shader-based copy
+                        // that only needs the source to be sampleable.
+                        let mut iformat: GLint = 0;
+                        let mut tex_w: GLint = 0;
+                        let mut tex_h: GLint = 0;
+                        gl::BindTexture(gl::TEXTURE_2D, host_texture);
+                        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_INTERNAL_FORMAT, &mut iformat);
+                        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut tex_w);
+                        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut tex_h);
+                        let fbo_status = gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER);
+                        gl::BindTexture(gl::TEXTURE_2D, 0);
                         warn!(
-                            "READ_FRAMEBUFFER incomplete for host texture {host_texture}"
+                            "READ_FRAMEBUFFER incomplete for host texture {host_texture} \
+                             (TEXTURE_2D probe — fbo_status=0x{fbo_status:x}, \
+                             internal_format=0x{iformat:x}, dims={tex_w}x{tex_h}, \
+                             expected color-renderable like GL_RGBA8=0x8058 / GL_RGB8=0x8051)"
                         );
                         gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
                         return false;
