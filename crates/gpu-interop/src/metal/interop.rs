@@ -26,8 +26,15 @@ use tracing::{error, warn};
 
 use crate::GpuBridge;
 
-/// Pixel format FourCC for BGRA8 ('BGRA' = 0x42475241).
-const IOSURFACE_PIXEL_FORMAT_BGRA: u32 = 0x42475241;
+/// Pixel format FourCC for RGBA16Float ('RGhA' = 0x52476841,
+/// `kCVPixelFormatType_64RGBAHalf`). Chosen as the IOSurface format
+/// because Resolume's 16-bit color mode hands us 16-bit-float input
+/// textures, and using a 16-bit-float bridge is lossless in both
+/// directions: 8-bit input → 16-bit (precision-expanding, lossless),
+/// 16-bit input → 16-bit (lossless), 16-bit output → 8-bit at the
+/// host boundary (lossless for our 0..1 color outputs that don't
+/// exceed 8-bit-representable precision anyway).
+const IOSURFACE_PIXEL_FORMAT_RGBA_HALF: u32 = 0x52476841;
 
 /// `GL_TEXTURE_RECTANGLE` is not in the `gl` crate's default API.
 const GL_TEXTURE_RECTANGLE: GLenum = 0x84F5;
@@ -89,7 +96,8 @@ impl IoSurfacePair {
 // IOSurface / texture creation
 // ---------------------------------------------------------------------------
 
-/// Create an IOSurface with BGRA8 pixel format via the CoreFoundation API.
+/// Create an IOSurface with RGBA16Float pixel format via the
+/// CoreFoundation API. 8 bytes per element (4 channels × 16 bits).
 fn create_iosurface(width: u32, height: u32) -> Option<CFRetained<IOSurfaceRef>> {
     unsafe {
         let k_width = objc2_io_surface::kIOSurfaceWidth;
@@ -99,8 +107,8 @@ fn create_iosurface(width: u32, height: u32) -> Option<CFRetained<IOSurfaceRef>>
 
         let v_width = CFNumber::new_i32(width as i32);
         let v_height = CFNumber::new_i32(height as i32);
-        let v_bpe = CFNumber::new_i32(4);
-        let v_pf = CFNumber::new_i32(IOSURFACE_PIXEL_FORMAT_BGRA as i32);
+        let v_bpe = CFNumber::new_i32(8);
+        let v_pf = CFNumber::new_i32(IOSURFACE_PIXEL_FORMAT_RGBA_HALF as i32);
 
         let keys: &[&CFString] = &[k_width, k_height, k_bpe, k_pf];
         let values: &[&CFNumber] = &[&v_width, &v_height, &v_bpe, &v_pf];
@@ -142,14 +150,16 @@ unsafe fn create_gl_texture_from_iosurface(
         gl::LINEAR as GLint,
     );
 
+    // Internal format RGBA16F + transfer (RGBA, HALF_FLOAT) match
+    // the IOSurface's RGBA16Float layout.
     let err = CGLTexImageIOSurface2D(
         cgl_ctx,
         GL_TEXTURE_RECTANGLE,
-        gl::RGBA as GLenum,
+        gl::RGBA16F as GLenum,
         width as GLsizei,
         height as GLsizei,
-        gl::BGRA,
-        gl::UNSIGNED_INT_8_8_8_8_REV,
+        gl::RGBA,
+        gl::HALF_FLOAT,
         surface,
         0, // plane
     );
@@ -174,7 +184,7 @@ fn create_metal_texture_from_iosurface(
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     let desc = MTLTextureDescriptor::new();
     desc.setTextureType(MTLTextureType::Type2D);
-    desc.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    desc.setPixelFormat(MTLPixelFormat::RGBA16Float);
     unsafe {
         desc.setWidth(width as usize);
         desc.setHeight(height as usize);
