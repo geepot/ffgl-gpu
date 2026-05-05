@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 use gl::types::{GLenum, GLint, GLsizei, GLuint, GLvoid};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -341,6 +341,29 @@ pub struct GlDx11Bridge {
     read_fbo: GLuint,
     draw_fbo: GLuint,
     dimensions: (u32, u32),
+    /// How to copy the host's input texture into the shared GL
+    /// texture. Probed on first frame, cached for the lifetime of the
+    /// bridge. See `Dx11InputBlitMode` below.
+    input_blit_mode: Dx11InputBlitMode,
+    /// Lazily-initialised on first shader-blit fallback. `None` means
+    /// either not needed yet or shader compile failed.
+    shader_blit: Option<crate::shader_blit::ShaderBlit>,
+}
+
+/// How to copy the host's input texture into our shared GL texture.
+/// Same shape as the macOS bridge's `InputBlitMode`.
+#[derive(Copy, Clone, Debug)]
+enum Dx11InputBlitMode {
+    /// Not yet probed.
+    Unknown,
+    /// `glBlitFramebuffer` works with the host texture attached at
+    /// `GL_TEXTURE_2D`. Fast path.
+    Fbo,
+    /// FBO probe failed (host texture not color-renderable, e.g.
+    /// BC1-compressed clip-source). Shader-blit needed.
+    Shader,
+    /// No path works. Bridge gives up on this input texture.
+    Failed,
 }
 
 impl GlDx11Bridge {
@@ -389,6 +412,8 @@ impl GlDx11Bridge {
             read_fbo: 0,
             draw_fbo: 0,
             dimensions: (0, 0),
+            input_blit_mode: Dx11InputBlitMode::Unknown,
+            shader_blit: None,
         })
     }
 
@@ -748,58 +773,29 @@ impl GpuBridge for GlDx11Bridge {
             return false;
         }
 
-        unsafe {
-            // READ side: attach the host texture (always TEXTURE_2D on Windows)
-            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
-            gl::FramebufferTexture2D(
-                gl::READ_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                host_texture,
-                0,
-            );
-
-            if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
-                warn!("READ_FRAMEBUFFER incomplete for host texture {host_texture}");
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                self.unlock_gl_texture_front_input();
-                return false;
-            }
-            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
-
-            // DRAW side: attach the shared TEXTURE_2D
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.draw_fbo);
-            gl::FramebufferTexture2D(
-                gl::DRAW_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                input_gl,
-                0,
-            );
-            gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
-
-            let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
-
-            gl::BlitFramebuffer(
-                0,
-                0,
-                src_w as GLsizei,
-                src_h as GLsizei,
-                0,
-                0,
-                dst_w as GLsizei,
-                dst_h as GLsizei,
-                gl::COLOR_BUFFER_BIT,
-                filter,
-            );
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::Flush();
-
-            // Unlock so D3D11 can access the input texture
-            self.unlock_gl_texture_front_input();
+        // Probe + cache the right input-copy path on first call.
+        // Resolume can hand us BC1-compressed clip-source textures
+        // that aren't color-renderable, so glBlitFramebuffer fails;
+        // sample-based fallback works on the same texture.
+        if matches!(self.input_blit_mode, Dx11InputBlitMode::Unknown) {
+            self.input_blit_mode = unsafe { self.dx11_probe_input_blit_mode(host_texture) };
         }
-        true
+
+        let result = unsafe {
+            match self.input_blit_mode {
+                Dx11InputBlitMode::Failed => false,
+                Dx11InputBlitMode::Unknown => false,
+                Dx11InputBlitMode::Fbo => self.dx11_fbo_blit_input(
+                    host_texture, input_gl, src_w, src_h, dst_w, dst_h, bilinear,
+                ),
+                Dx11InputBlitMode::Shader => {
+                    self.dx11_shader_blit_input(host_texture, input_gl, dst_w, dst_h)
+                }
+            }
+        };
+
+        unsafe { self.unlock_gl_texture_front_input() };
+        result
     }
 
     fn blit_back_output_to_target_scaled(
@@ -969,6 +965,142 @@ impl GpuBridge for GlDx11Bridge {
 
     fn dimensions(&self) -> (u32, u32) {
         self.dimensions
+    }
+}
+
+// Inherent helpers used by `blit_input_from_host_scaled` above. Not
+// part of the GpuBridge trait surface.
+impl GlDx11Bridge {
+    /// Try `glBlitFramebuffer` with the host texture attached as
+    /// `TEXTURE_2D`; if that fails, fall through to the shader-based
+    /// path (same texture, sampleable but not FBO-attachable).
+    /// Caches the result.
+    ///
+    /// # Safety
+    /// A current GL context must be active.
+    unsafe fn dx11_probe_input_blit_mode(&mut self, host_texture: GLuint) -> Dx11InputBlitMode {
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
+        gl::FramebufferTexture2D(
+            gl::READ_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            host_texture,
+            0,
+        );
+        if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            return Dx11InputBlitMode::Fbo;
+        }
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+
+        // FBO probe failed — log the format for diagnosis and fall
+        // through to the shader path.
+        let mut iformat: GLint = 0;
+        let mut tex_w: GLint = 0;
+        let mut tex_h: GLint = 0;
+        gl::BindTexture(gl::TEXTURE_2D, host_texture);
+        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_INTERNAL_FORMAT, &mut iformat);
+        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut tex_w);
+        gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut tex_h);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        info!(
+            "host texture {host_texture} not color-renderable \
+             (internal_format=0x{iformat:x}, dims={tex_w}x{tex_h}) — \
+             falling back to shader-based blit"
+        );
+
+        if self.shader_blit.is_none() {
+            self.shader_blit = crate::shader_blit::ShaderBlit::new();
+            if self.shader_blit.is_none() {
+                warn!("ShaderBlit init failed — bridge cannot copy this input texture");
+                return Dx11InputBlitMode::Failed;
+            }
+        }
+        Dx11InputBlitMode::Shader
+    }
+
+    /// FBO-based input blit. Caller has confirmed the host texture is
+    /// FBO-attachable as `TEXTURE_2D`.
+    ///
+    /// # Safety
+    /// A current GL context must be active.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dx11_fbo_blit_input(
+        &self,
+        host_texture: GLuint,
+        input_gl: GLuint,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+    ) -> bool {
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
+        gl::FramebufferTexture2D(
+            gl::READ_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            host_texture,
+            0,
+        );
+        gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
+
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.draw_fbo);
+        gl::FramebufferTexture2D(
+            gl::DRAW_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            input_gl,
+            0,
+        );
+        gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
+
+        let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
+        gl::BlitFramebuffer(
+            0, 0, src_w as GLsizei, src_h as GLsizei,
+            0, 0, dst_w as GLsizei, dst_h as GLsizei,
+            gl::COLOR_BUFFER_BIT,
+            filter,
+        );
+
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::Flush();
+        true
+    }
+
+    /// Shader-based input blit. Used when the host texture isn't
+    /// FBO-attachable (compressed BC1/DXT1 from a clip source, etc.).
+    ///
+    /// # Safety
+    /// A current GL context must be active.
+    unsafe fn dx11_shader_blit_input(
+        &self,
+        host_texture: GLuint,
+        input_gl: GLuint,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> bool {
+        let blit = match &self.shader_blit {
+            Some(b) => b,
+            None => return false,
+        };
+
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.draw_fbo);
+        gl::FramebufferTexture2D(
+            gl::DRAW_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            input_gl,
+            0,
+        );
+        gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
+
+        // Windows interop is always TEXTURE_2D on both sides.
+        blit.blit_2d(host_texture, dst_w, dst_h);
+
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::Flush();
+        true
     }
 }
 
