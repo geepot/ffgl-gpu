@@ -175,6 +175,22 @@ mod metal_impl {
     ) {
         encoder.setComputePipelineState(&pipeline.state);
 
+        // Naga emits `var<workgroup>` arrays as a `threadgroup T& foo`
+        // *parameter* in MSL, which Metal treats as host-sized memory.
+        // If the caller's BindSet specifies threadgroup-memory bytes,
+        // tell the encoder. Without this, Metal hands the kernel a
+        // zero-sized threadgroup buffer; reads return 0 and writes go
+        // nowhere — a silent failure that imitates a barrier or
+        // algorithm bug.
+        if bindings.threadgroup_memory_bytes > 0 {
+            unsafe {
+                encoder.setThreadgroupMemoryLength_atIndex(
+                    bindings.threadgroup_memory_bytes,
+                    0,
+                );
+            }
+        }
+
         // Metal does not have a separate UAV register class — both
         // `texture_read` and `texture_rw` map to the same texture-slot
         // space. Bind both tables; if the WGSL author used the same

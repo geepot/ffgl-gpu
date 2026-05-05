@@ -157,6 +157,18 @@ pub struct BindSet<'a> {
     /// not enforce this since it can't tell which platform you'll
     /// dispatch on.
     pub(crate) uniforms: Vec<Option<UniformsBinding<'a>>>,
+    /// Bytes of dynamically-allocated threadgroup (Metal) / groupshared
+    /// (DX11) memory the kernel needs. Naga emits WGSL `var<workgroup>`
+    /// as a `threadgroup type& foo` *parameter* in MSL, which Metal
+    /// treats as host-sized memory and silently provides 0 bytes
+    /// unless the encoder gets `setThreadgroupMemoryLength`. Reads
+    /// from un-sized threadgroup memory return zero / writes go
+    /// nowhere — a really subtle bug that disguises itself as a
+    /// barrier / algorithm issue. Default `0` for kernels without
+    /// `var<workgroup>`. DX11/HLSL `groupshared` is statically sized
+    /// by the compiler so this field is Metal-only on the dispatch
+    /// side.
+    pub(crate) threadgroup_memory_bytes: usize,
 }
 
 impl<'a> BindSet<'a> {
@@ -169,6 +181,7 @@ impl<'a> BindSet<'a> {
             buffers_rw: Vec::new(),
             samplers: Vec::new(),
             uniforms: Vec::new(),
+            threadgroup_memory_bytes: 0,
         }
     }
 
@@ -244,6 +257,18 @@ impl<'a> BindSet<'a> {
     pub fn uniforms(mut self, slot: usize, b: UniformsBinding<'a>) -> Self {
         ensure_slot(&mut self.uniforms, slot);
         self.uniforms[slot] = Some(b);
+        self
+    }
+
+    /// Total bytes of threadgroup (Metal) / groupshared (DX11) memory
+    /// this kernel needs. Required for any kernel that declares a
+    /// `var<workgroup>` array — naga emits it as host-sized memory in
+    /// MSL output and Metal silently provides 0 bytes if not told
+    /// otherwise. Compute as `count * size_of::<elem>()` for the
+    /// largest workgroup array in the kernel; sum if there are
+    /// multiple.
+    pub fn threadgroup_memory(mut self, bytes: usize) -> Self {
+        self.threadgroup_memory_bytes = bytes;
         self
     }
 
