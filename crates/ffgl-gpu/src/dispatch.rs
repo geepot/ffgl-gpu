@@ -1012,9 +1012,23 @@ mod dx11_impl {
                 ctx.Dispatch(groups_x, groups_y, 1);
 
                 // Unbind all CS resources to prevent hazards when the same
-                // texture is used as SRV in a subsequent pass.
-                let null_uavs: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
-                let null_srvs: [Option<ID3D11ShaderResourceView>; 8] = Default::default();
+                // resource is used as SRV in a subsequent pass — DX11
+                // silently NULLs an SRV view if the underlying resource
+                // is still bound as a UAV anywhere on the stage.
+                //
+                // Size the unbind arrays to cover every slot we just
+                // bound. The previous fixed length of 8 missed any slot
+                // ≥ 8 — a UAV at u8+ would leak across passes and the
+                // next pass's SRV bind to the same buffer would silently
+                // fail. The 8-floor stays for cases where this dispatch
+                // bound fewer than 8 — a prior dispatch may have left a
+                // higher-numbered binding live and we want to clear it.
+                let uav_unbind_len = uavs.len().max(8);
+                let srv_unbind_len = srvs.len().max(8);
+                let null_uavs: Vec<Option<ID3D11UnorderedAccessView>> =
+                    vec![None; uav_unbind_len];
+                let null_srvs: Vec<Option<ID3D11ShaderResourceView>> =
+                    vec![None; srv_unbind_len];
                 let null_samplers: [Option<ID3D11SamplerState>; 4] = Default::default();
                 let null_cbufs: [Option<ID3D11Buffer>; 1] = Default::default();
                 ctx.CSSetUnorderedAccessViews(
