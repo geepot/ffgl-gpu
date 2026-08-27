@@ -64,6 +64,9 @@ pub trait SimpleFFGLInstance: FFGLInstance + Send + Sync {
         vec![]
     }
 
+    /// Store the texture orientation selected by an FFGL 2.x host.
+    fn set_top_left_texture_orientation(&mut self, _enabled: bool) {}
+
     /// Called by [crate::conversions::Op::ProcessOpenGL] to draw the plugin
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput);
 }
@@ -87,6 +90,10 @@ impl<T: SimpleFFGLInstance> FFGLInstance for T {
 
     fn consume_param_events(&mut self, max_events: usize) -> Vec<(u32, u64)> {
         SimpleFFGLInstance::consume_param_events(self, max_events)
+    }
+
+    fn set_top_left_texture_orientation(&mut self, enabled: bool) {
+        SimpleFFGLInstance::set_top_left_texture_orientation(self, enabled)
     }
 
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput) {

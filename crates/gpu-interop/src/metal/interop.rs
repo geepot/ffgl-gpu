@@ -18,12 +18,13 @@ use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString};
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
-    MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLDevice, MTLPixelFormat, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
-use objc2_open_gl::{CGLError, CGLGetCurrentContext, CGLTexImageIOSurface2D};
+use objc2_open_gl::{CGLContextObj, CGLError, CGLGetCurrentContext, CGLTexImageIOSurface2D};
 
 use crate::shader_blit::ShaderBlit;
+use crate::bridge::is_fresh_previous_frame;
 
 /// How to copy the host's input texture into our shared input texture.
 /// Cached on first call so we don't re-probe every frame.
@@ -70,6 +71,7 @@ struct SharedTexture {
     _iosurface: CFRetained<IOSurfaceRef>,
     gl_texture: GLuint,
     metal_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    owner_ctx: CGLContextObj,
 }
 
 impl SharedTexture {
@@ -83,6 +85,7 @@ impl SharedTexture {
             _iosurface: iosurface,
             gl_texture,
             metal_texture,
+            owner_ctx: unsafe { CGLGetCurrentContext() },
         })
     }
 }
@@ -91,6 +94,9 @@ impl Drop for SharedTexture {
     fn drop(&mut self) {
         if self.gl_texture != 0 {
             unsafe {
+                if CGLGetCurrentContext() != self.owner_ctx {
+                    return;
+                }
                 gl::DeleteTextures(1, &self.gl_texture);
             }
         }
@@ -256,6 +262,11 @@ pub struct GlMetalBridge {
     /// either not needed yet or shader compile failed (in which case
     /// we'll have flipped `input_blit_mode` to `Failed`).
     shader_blit: Option<ShaderBlit>,
+    /// Raster presenter for host-facing output. Kept separate from the input
+    /// fallback because the two paths have independent lifetimes.
+    present_shader: Option<ShaderBlit>,
+    /// CGL context that owns every GL name held by this bridge.
+    owner_ctx: CGLContextObj,
 }
 
 impl GlMetalBridge {
@@ -274,6 +285,8 @@ impl GlMetalBridge {
             dimensions: (0, 0),
             input_blit_mode: InputBlitMode::Unknown,
             shader_blit: None,
+            present_shader: None,
+            owner_ctx: std::ptr::null_mut(),
         }
     }
 
@@ -312,10 +325,10 @@ impl GlMetalBridge {
 
     /// Check whether the bridge FBO handles are still valid.
     pub fn is_valid(&self) -> bool {
-        if self.read_fbo == 0 && self.draw_fbo == 0 {
-            return self.dimensions == (0, 0); // not yet initialised is valid
+        if self.owner_ctx.is_null() {
+            return true;
         }
-        unsafe { gl::IsFramebuffer(self.read_fbo) != 0 && gl::IsFramebuffer(self.draw_fbo) != 0 }
+        unsafe { CGLGetCurrentContext() == self.owner_ctx }
     }
 
     /// Borrow the stored Metal device.
@@ -346,7 +359,7 @@ impl GpuBridge for GlMetalBridge {
         }
 
         // Dimension change: wait for any in-flight work before destroying textures.
-        self.wait_for_previous();
+        let _ = self.wait_for_previous();
 
         // Clean up old FBOs (unbind first to avoid deleting a bound FBO).
         unsafe {
@@ -381,6 +394,7 @@ impl GpuBridge for GlMetalBridge {
         self.last_dispatch_frame = None;
         self.last_dispatch_time = None;
         self.input_blit_mode = InputBlitMode::Unknown;
+        self.owner_ctx = unsafe { CGLGetCurrentContext() };
         Ok(())
     }
 
@@ -392,11 +406,33 @@ impl GpuBridge for GlMetalBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
+        uv_scale: (f32, f32),
     ) -> bool {
         let input_gl = match &self.pairs[self.front] {
             Some(pair) => pair.input.gl_texture,
             None => return false,
         };
+
+        // A host may change source format without resizing. Revalidate the
+        // cached attachable path every frame so a switch to compressed input
+        // falls through to shader sampling instead of blitting an incomplete FBO.
+        if let InputBlitMode::Fbo(target) = self.input_blit_mode {
+            unsafe {
+                gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
+                gl::FramebufferTexture2D(
+                    gl::READ_FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    target,
+                    host_texture,
+                    0,
+                );
+                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER)
+                    != gl::FRAMEBUFFER_COMPLETE
+                {
+                    self.input_blit_mode = InputBlitMode::Unknown;
+                }
+            }
+        }
 
         // Probe + cache the right input-copy path on first call.
         if matches!(self.input_blit_mode, InputBlitMode::Unknown) {
@@ -411,7 +447,9 @@ impl GpuBridge for GlMetalBridge {
                     self.fbo_blit_input(target, host_texture, input_gl, src_w, src_h, dst_w, dst_h, bilinear)
                 }
                 InputBlitMode::Shader(target) => {
-                    self.shader_blit_input(target, host_texture, input_gl, src_w, src_h, dst_w, dst_h)
+                    self.shader_blit_input(
+                        target, host_texture, input_gl, src_w, src_h, dst_w, dst_h, uv_scale,
+                    )
                 }
             }
         }
@@ -422,6 +460,8 @@ impl GpuBridge for GlMetalBridge {
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -433,36 +473,10 @@ impl GpuBridge for GlMetalBridge {
         };
 
         unsafe {
-            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
-            gl::FramebufferTexture2D(
-                gl::READ_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                GL_TEXTURE_RECTANGLE,
-                output_gl,
-                0,
-            );
-            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
-
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, host_fbo);
-
-            let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
-
-            gl::BlitFramebuffer(
-                0,
-                0,
-                src_w as GLsizei,
-                src_h as GLsizei,
-                0,
-                0,
-                dst_w as GLsizei,
-                dst_h as GLsizei,
-                gl::COLOR_BUFFER_BIT,
-                filter,
-            );
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            self.present_output(
+                output_gl, host_fbo, src_w, src_h, dst_x, dst_y, dst_w, dst_h, bilinear,
+            )
         }
-        true
     }
 
     fn blit_output_to_target_scaled(
@@ -470,6 +484,8 @@ impl GpuBridge for GlMetalBridge {
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -480,58 +496,61 @@ impl GpuBridge for GlMetalBridge {
         };
 
         unsafe {
-            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
-            gl::FramebufferTexture2D(
-                gl::READ_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                GL_TEXTURE_RECTANGLE,
-                output_gl,
-                0,
-            );
-            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
+            self.present_output(
+                output_gl, host_fbo, src_w, src_h, dst_x, dst_y, dst_w, dst_h, bilinear,
+            )
+        }
+    }
 
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, host_fbo);
+    fn has_result_ready(&self, current_frame: u64) -> bool {
+        self.pending_command_buffer
+            .as_ref()
+            .is_some_and(|cb| cb.status() != MTLCommandBufferStatus::Error)
+            && self
+                .last_dispatch_time
+                .is_some_and(|time| {
+                    is_fresh_previous_frame(
+                        self.last_dispatch_frame,
+                        current_frame,
+                        time.elapsed(),
+                    )
+                })
+    }
 
-            let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
-
-            gl::BlitFramebuffer(
-                0,
-                0,
-                src_w as GLsizei,
-                src_h as GLsizei,
-                0,
-                0,
-                dst_w as GLsizei,
-                dst_h as GLsizei,
-                gl::COLOR_BUFFER_BIT,
-                filter,
-            );
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+    fn wait_for_previous(&mut self) -> bool {
+        if let Some(cb) = self.pending_command_buffer.take() {
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed
+                && status != MTLCommandBufferStatus::Error
+            {
+                cb.waitUntilCompleted();
+            }
+            if cb.status() == MTLCommandBufferStatus::Error {
+                error!("Metal command buffer failed; discarding the frame");
+                return false;
+            }
         }
         true
     }
 
-    fn has_result_ready(&self, current_frame: u64) -> bool {
-        self.pending_command_buffer.is_some()
-            && self
-                .last_dispatch_frame
-                .is_some_and(|last| current_frame == last.wrapping_add(1))
-            && self
-                .last_dispatch_time
-                .is_some_and(|t| t.elapsed().as_millis() < 100)
-    }
-
-    fn wait_for_previous(&mut self) {
-        if let Some(cb) = self.pending_command_buffer.take() {
-            cb.waitUntilCompleted();
-        }
-    }
-
-    fn wait_for_pending(&mut self) {
+    fn wait_for_pending(&mut self) -> bool {
         if let Some(cb) = self.pending_command_buffer.as_ref() {
-            cb.waitUntilCompleted();
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed
+                && status != MTLCommandBufferStatus::Error
+            {
+                cb.waitUntilCompleted();
+            }
+            if cb.status() == MTLCommandBufferStatus::Error {
+                error!("Metal command buffer failed; discarding the frame");
+                return false;
+            }
         }
+        true
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.pending_command_buffer.is_some()
     }
 
     fn swap(&mut self) {
@@ -545,28 +564,49 @@ impl GpuBridge for GlMetalBridge {
 
     fn cleanup(&mut self) {
         if let Some(cb) = self.pending_command_buffer.take() {
-            cb.waitUntilCompleted();
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed
+                && status != MTLCommandBufferStatus::Error
+            {
+                cb.waitUntilCompleted();
+            }
         }
         self.pairs = [None, None];
         self.front = 0;
         self.last_dispatch_frame = None;
         self.last_dispatch_time = None;
-        unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            if self.read_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.read_fbo);
-                self.read_fbo = 0;
+        let owns_context = unsafe {
+            !self.owner_ctx.is_null() && CGLGetCurrentContext() == self.owner_ctx
+        };
+        if owns_context {
+            unsafe {
+                if self.read_fbo != 0 {
+                    gl::DeleteFramebuffers(1, &self.read_fbo);
+                }
+                if self.draw_fbo != 0 {
+                    gl::DeleteFramebuffers(1, &self.draw_fbo);
+                }
             }
-            if self.draw_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.draw_fbo);
-                self.draw_fbo = 0;
+        } else {
+            if let Some(shader) = self.shader_blit.take() {
+            // ShaderBlit::drop deletes context-local GL names. In a foreign
+            // context, intentionally leak those names rather than deleting
+            // unrelated host objects that reused the same numeric IDs.
+                std::mem::forget(shader);
+            }
+            if let Some(shader) = self.present_shader.take() {
+                std::mem::forget(shader);
             }
         }
+        self.read_fbo = 0;
+        self.draw_fbo = 0;
         self.dimensions = (0, 0);
         self.input_blit_mode = InputBlitMode::Unknown;
         // Drop the shader pipeline too — it'll be re-created on next
         // use if the new texture also needs the shader path.
         self.shader_blit = None;
+        self.present_shader = None;
+        self.owner_ctx = std::ptr::null_mut();
     }
 
     fn dimensions(&self) -> (u32, u32) {
@@ -578,6 +618,58 @@ impl GpuBridge for GlMetalBridge {
 // in a separate impl block since they're not part of the GpuBridge
 // trait surface.
 impl GlMetalBridge {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn present_output(
+        &mut self,
+        output_texture: GLuint,
+        target_fbo: GLuint,
+        src_w: u32,
+        src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+    ) -> bool {
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, target_fbo);
+        if gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+            error!("Host draw framebuffer is incomplete; refusing to present");
+            return false;
+        }
+        if self
+            .present_shader
+            .as_ref()
+            .is_some_and(|shader| !shader.is_valid())
+        {
+            if let Some(shader) = self.present_shader.take() {
+                std::mem::forget(shader);
+            }
+        }
+        if self.present_shader.is_none() {
+            self.present_shader = ShaderBlit::new();
+        }
+        let Some(shader) = self.present_shader.as_ref() else {
+            return false;
+        };
+        while gl::GetError() != gl::NO_ERROR {}
+        shader.present_rect(
+            output_texture,
+            src_w,
+            src_h,
+            dst_x,
+            dst_y,
+            dst_w,
+            dst_h,
+            bilinear,
+        );
+        let error_code = gl::GetError();
+        if error_code != gl::NO_ERROR {
+            error!(error_code, "OpenGL host presentation failed");
+            return false;
+        }
+        true
+    }
+
     /// Try `glBlitFramebuffer` with the host texture attached as
     /// `TEXTURE_2D`, then `TEXTURE_RECTANGLE`; if both fail, fall
     /// through to the shader-based path. Caches the outcome.
@@ -700,6 +792,7 @@ impl GlMetalBridge {
         src_h: u32,
         dst_w: u32,
         dst_h: u32,
+        uv_scale: (f32, f32),
     ) -> bool {
         let blit = match &self.shader_blit {
             Some(b) => b,
@@ -717,9 +810,9 @@ impl GlMetalBridge {
         gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
 
         if target == GL_TEXTURE_RECTANGLE {
-            blit.blit_rect(host_texture, src_w, src_h, dst_w, dst_h);
+            blit.blit_rect(host_texture, src_w, src_h, dst_w, dst_h, uv_scale);
         } else {
-            blit.blit_2d(host_texture, dst_w, dst_h);
+            blit.blit_2d(host_texture, dst_w, dst_h, uv_scale);
         }
 
         gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
@@ -730,21 +823,6 @@ impl GlMetalBridge {
 
 impl Drop for GlMetalBridge {
     fn drop(&mut self) {
-        // Wait for any in-flight GPU work before destroying shared textures.
-        if let Some(cb) = self.pending_command_buffer.take() {
-            cb.waitUntilCompleted();
-        }
-        // Drop pairs (releases IOSurfaces and GL textures via SharedTexture::drop).
-        self.pairs = [None, None];
-        // Unbind before deleting to avoid GL errors on some drivers.
-        unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            if self.read_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.read_fbo);
-            }
-            if self.draw_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.draw_fbo);
-            }
-        }
+        self.cleanup();
     }
 }

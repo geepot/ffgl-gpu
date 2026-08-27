@@ -315,6 +315,12 @@ pub struct DxBlur {
 unsafe impl Send for DxBlur {}
 unsafe impl Sync for DxBlur {}
 
+impl Drop for DxBlur {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for DxBlur {
     fn new(inst_data: &FFGLData) -> Self {
         let default_radius = cached_params()[0].default_val();

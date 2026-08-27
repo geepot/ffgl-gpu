@@ -281,6 +281,12 @@ pub struct KitchenSink {
 unsafe impl Send for KitchenSink {}
 unsafe impl Sync for KitchenSink {}
 
+impl Drop for KitchenSink {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for KitchenSink {
     fn new(inst_data: &FFGLData) -> Self {
         let params_info = cached_params();

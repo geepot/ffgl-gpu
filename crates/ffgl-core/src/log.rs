@@ -15,6 +15,18 @@ pub type FFGLLogger = unsafe extern "C" fn(*const c_char);
 
 struct FFGLWriter;
 
+#[cfg(target_os = "windows")]
+fn write_windows_debug_output(message: &str) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OutputDebugStringA(output_string: *const c_char);
+    }
+
+    if let Ok(message) = CString::new(format!("{message}\n")) {
+        unsafe { OutputDebugStringA(message.as_ptr()) };
+    }
+}
+
 impl io::Write for FFGLWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut str = String::from_utf8_lossy(buf);
@@ -33,6 +45,8 @@ impl io::Write for FFGLWriter {
 
             unsafe { logger(str.as_ptr()) };
         } else {
+            #[cfg(target_os = "windows")]
+            write_windows_debug_output(&str);
             eprintln!("{}", str);
         }
 

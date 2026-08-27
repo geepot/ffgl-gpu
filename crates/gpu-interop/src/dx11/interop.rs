@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::OpenGL::*;
 
 use crate::GpuBridge;
+use crate::bridge::is_fresh_previous_frame;
 
 /// WGL_NV_DX_interop2 constants.
 const WGL_ACCESS_READ_WRITE_NV: GLenum = 0x0001;
@@ -116,18 +117,12 @@ struct SharedTexture {
     gl_texture: GLuint,
     /// WGL interop handle returned by wglDXRegisterObjectNV.
     interop_handle: *mut GLvoid,
+    unregister: WglDxUnregisterObjectNv,
+    interop_device: *mut GLvoid,
+    owner_ctx: *mut core::ffi::c_void,
 }
 
 impl SharedTexture {
-    /// Clean up the GL texture manually. Called by `destroy_pairs` which
-    /// handles WGL interop unregistration separately.
-    fn delete_gl_texture(&mut self) {
-        if self.gl_texture != 0 {
-            unsafe { gl::DeleteTextures(1, &self.gl_texture) };
-            self.gl_texture = 0;
-        }
-    }
-
     fn new(
         device: &ID3D11Device,
         wgl_fns: &WglInteropFunctions,
@@ -193,19 +188,25 @@ impl SharedTexture {
             d3d_texture,
             gl_texture,
             interop_handle,
+            unregister: wgl_fns.dx_unregister_object,
+            interop_device,
+            owner_ctx: unsafe { wglGetCurrentContext().0 },
         })
     }
 }
 
 impl Drop for SharedTexture {
     fn drop(&mut self) {
-        // Safety net: delete the GL texture if it hasn't been cleaned up by
-        // destroy_pairs(). The interop handle cannot be unregistered here
-        // because we don't have access to the WGL function pointers or the
-        // interop device — that is handled by GlDx11Bridge::destroy_pairs().
-        if self.gl_texture != 0 {
-            unsafe { gl::DeleteTextures(1, &self.gl_texture) };
-            self.gl_texture = 0;
+        unsafe {
+            if wglGetCurrentContext().0 != self.owner_ctx {
+                return;
+            }
+            if !self.interop_handle.is_null() {
+                (self.unregister)(self.interop_device, self.interop_handle);
+            }
+            if self.gl_texture != 0 {
+                gl::DeleteTextures(1, &self.gl_texture);
+            }
         }
     }
 }
@@ -348,6 +349,10 @@ pub struct GlDx11Bridge {
     /// Lazily-initialised on first shader-blit fallback. `None` means
     /// either not needed yet or shader compile failed.
     shader_blit: Option<crate::shader_blit::ShaderBlit>,
+    /// Raster presenter for host-facing output.
+    present_shader: Option<crate::shader_blit::ShaderBlit>,
+    /// WGL context that owns the GL names and interop device.
+    owner_ctx: *mut core::ffi::c_void,
 }
 
 /// How to copy the host's input texture into our shared GL texture.
@@ -414,6 +419,8 @@ impl GlDx11Bridge {
             dimensions: (0, 0),
             input_blit_mode: Dx11InputBlitMode::Unknown,
             shader_blit: None,
+            present_shader: None,
+            owner_ctx: unsafe { wglGetCurrentContext().0 },
         })
     }
 
@@ -495,10 +502,7 @@ impl GlDx11Bridge {
 
     /// Check whether the bridge FBO handles are still valid.
     pub fn is_valid(&self) -> bool {
-        if self.read_fbo == 0 && self.draw_fbo == 0 {
-            return self.dimensions == (0, 0); // not yet initialised is valid
-        }
-        unsafe { gl::IsFramebuffer(self.read_fbo) != 0 && gl::IsFramebuffer(self.draw_fbo) != 0 }
+        unsafe { wglGetCurrentContext().0 == self.owner_ctx }
     }
 
     // -- Lock / unlock helpers ------------------------------------------------
@@ -608,9 +612,9 @@ impl GlDx11Bridge {
     /// Wait for all pending D3D11 dispatches to complete, draining oldest-first.
     /// Older queries (2+ frames ago) are typically already complete, making their
     /// checks instantaneous and reducing total spin time on the most recent query.
-    fn wait_for_gpu(&mut self) {
+    fn wait_for_gpu(&mut self) -> bool {
         if self.pending_queries == 0 {
-            return;
+            return true;
         }
         let start = Instant::now();
         while self.pending_queries > 0 {
@@ -619,19 +623,20 @@ impl GlDx11Bridge {
             } else if start.elapsed().as_millis() > 100 {
                 warn!("GPU query timed out after 100ms, proceeding anyway");
                 self.pending_queries = 0;
-                break;
+                return false;
             } else {
                 std::thread::yield_now();
             }
         }
+        true
     }
 
     /// Wait for the most recent D3D11 dispatch WITHOUT clearing pending state.
     /// Used in the synchronous fallback path (first frame / after gap) so that
     /// `has_result_ready()` still returns true on the next frame, enabling pipelining.
-    fn wait_for_gpu_pending(&self) {
+    fn wait_for_gpu_pending(&self) -> bool {
         if self.pending_queries == 0 {
-            return;
+            return true;
         }
         // Wait for the latest query (most recently issued dispatch)
         let latest_slot = ((self.dispatch_count - 1) % PIPELINE_DEPTH as u64) as usize;
@@ -647,11 +652,11 @@ impl GlDx11Bridge {
                 );
             }
             if done != 0 {
-                break;
+                return true;
             }
             if start.elapsed().as_millis() > 100 {
                 warn!("GPU query timed out after 100ms, proceeding anyway");
-                break;
+                return false;
             }
             std::thread::yield_now();
         }
@@ -659,24 +664,7 @@ impl GlDx11Bridge {
 
     /// Unregister all shared textures and drop the pairs.
     fn destroy_pairs(&mut self) {
-        for pair in &mut self.pairs {
-            if let Some(mut p) = pair.take() {
-                unsafe {
-                    (self.wgl_fns.dx_unregister_object)(
-                        self.interop_device,
-                        p.input.interop_handle,
-                    );
-                    p.input.interop_handle = std::ptr::null_mut();
-                    p.input.delete_gl_texture();
-                    (self.wgl_fns.dx_unregister_object)(
-                        self.interop_device,
-                        p.output.interop_handle,
-                    );
-                    p.output.interop_handle = std::ptr::null_mut();
-                    p.output.delete_gl_texture();
-                }
-            }
-        }
+        self.pairs = [None, None];
     }
 }
 
@@ -702,7 +690,7 @@ impl GpuBridge for GlDx11Bridge {
         }
 
         // Dimension change: wait for any in-flight work before destroying textures
-        self.wait_for_previous();
+        let _ = self.wait_for_previous();
 
         // Clean up old pairs (unregister from interop first)
         self.destroy_pairs();
@@ -761,6 +749,7 @@ impl GpuBridge for GlDx11Bridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
+        uv_scale: (f32, f32),
     ) -> bool {
         let input_gl = match &self.pairs[self.front] {
             Some(pair) => pair.input.gl_texture,
@@ -771,6 +760,24 @@ impl GpuBridge for GlDx11Bridge {
         if unsafe { !self.lock_gl_texture_front_input() } {
             warn!("Failed to lock GL input texture for input blit");
             return false;
+        }
+
+        if matches!(self.input_blit_mode, Dx11InputBlitMode::Fbo) {
+            unsafe {
+                gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
+                gl::FramebufferTexture2D(
+                    gl::READ_FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::TEXTURE_2D,
+                    host_texture,
+                    0,
+                );
+                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER)
+                    != gl::FRAMEBUFFER_COMPLETE
+                {
+                    self.input_blit_mode = Dx11InputBlitMode::Unknown;
+                }
+            }
         }
 
         // Probe + cache the right input-copy path on first call.
@@ -789,7 +796,7 @@ impl GpuBridge for GlDx11Bridge {
                     host_texture, input_gl, src_w, src_h, dst_w, dst_h, bilinear,
                 ),
                 Dx11InputBlitMode::Shader => {
-                    self.dx11_shader_blit_input(host_texture, input_gl, dst_w, dst_h)
+                    self.dx11_shader_blit_input(host_texture, input_gl, dst_w, dst_h, uv_scale)
                 }
             }
         };
@@ -803,6 +810,8 @@ impl GpuBridge for GlDx11Bridge {
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -819,42 +828,16 @@ impl GpuBridge for GlDx11Bridge {
             return false;
         }
 
-        unsafe {
-            // Attach output as READ source
-            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
-            gl::FramebufferTexture2D(
-                gl::READ_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                output_gl,
-                0,
-            );
-            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
-
-            // DRAW to target
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, host_fbo);
-
-            let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
-
-            gl::BlitFramebuffer(
-                0,
-                0,
-                src_w as GLsizei,
-                src_h as GLsizei,
-                0,
-                0,
-                dst_w as GLsizei,
-                dst_h as GLsizei,
-                gl::COLOR_BUFFER_BIT,
-                filter,
-            );
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::Flush();
-
-            self.unlock_gl_texture_back_output();
+        let presented = unsafe {
+            self.present_output(output_gl, host_fbo, dst_x, dst_y, dst_w, dst_h, bilinear)
+        };
+        unsafe { gl::Flush() };
+        let unlocked = unsafe { self.unlock_gl_texture_back_output() };
+        if !unlocked {
+            error!("Failed to unlock back output GL texture after presentation");
         }
-        true
+        let _ = (src_w, src_h);
+        presented && unlocked
     }
 
     fn blit_output_to_target_scaled(
@@ -862,6 +845,8 @@ impl GpuBridge for GlDx11Bridge {
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -877,56 +862,33 @@ impl GpuBridge for GlDx11Bridge {
             return false;
         }
 
-        unsafe {
-            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo);
-            gl::FramebufferTexture2D(
-                gl::READ_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                output_gl,
-                0,
-            );
-            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
-
-            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, host_fbo);
-
-            let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
-
-            gl::BlitFramebuffer(
-                0,
-                0,
-                src_w as GLsizei,
-                src_h as GLsizei,
-                0,
-                0,
-                dst_w as GLsizei,
-                dst_h as GLsizei,
-                gl::COLOR_BUFFER_BIT,
-                filter,
-            );
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::Flush();
-
-            self.unlock_gl_texture_front_output();
+        let presented = unsafe {
+            self.present_output(output_gl, host_fbo, dst_x, dst_y, dst_w, dst_h, bilinear)
+        };
+        unsafe { gl::Flush() };
+        let unlocked = unsafe { self.unlock_gl_texture_front_output() };
+        if !unlocked {
+            error!("Failed to unlock front output GL texture after presentation");
         }
-        true
+        let _ = (src_w, src_h);
+        presented && unlocked
     }
 
     fn has_result_ready(&self, current_frame: u64) -> bool {
         self.pending_queries > 0
-            && self.last_dispatch_time.elapsed().as_millis() < 250
-            && self
-                .last_dispatch_frame
-                .is_some_and(|last| current_frame == last.wrapping_add(1))
+            && is_fresh_previous_frame(
+                self.last_dispatch_frame,
+                current_frame,
+                self.last_dispatch_time.elapsed(),
+            )
     }
 
-    fn wait_for_previous(&mut self) {
-        self.wait_for_gpu();
+    fn wait_for_previous(&mut self) -> bool {
+        self.wait_for_gpu()
     }
 
-    fn wait_for_pending(&mut self) {
-        self.wait_for_gpu_pending();
+    fn wait_for_pending(&mut self) -> bool {
+        self.wait_for_gpu_pending()
     }
 
     fn swap(&mut self) {
@@ -945,21 +907,33 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn cleanup(&mut self) {
-        self.wait_for_gpu();
+        if self.is_valid() {
+            let _ = self.wait_for_gpu();
+        }
         self.destroy_pairs();
         self.front = 0;
         self.last_dispatch_frame = None;
-        unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            if self.read_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.read_fbo);
-                self.read_fbo = 0;
+        if self.is_valid() {
+            unsafe {
+                if self.read_fbo != 0 {
+                    gl::DeleteFramebuffers(1, &self.read_fbo);
+                }
+                if self.draw_fbo != 0 {
+                    gl::DeleteFramebuffers(1, &self.draw_fbo);
+                }
             }
-            if self.draw_fbo != 0 {
-                gl::DeleteFramebuffers(1, &self.draw_fbo);
-                self.draw_fbo = 0;
+        } else {
+            if let Some(shader) = self.shader_blit.take() {
+                std::mem::forget(shader);
+            }
+            if let Some(shader) = self.present_shader.take() {
+                std::mem::forget(shader);
             }
         }
+        self.read_fbo = 0;
+        self.draw_fbo = 0;
+        self.shader_blit = None;
+        self.present_shader = None;
         self.dimensions = (0, 0);
     }
 
@@ -971,6 +945,47 @@ impl GpuBridge for GlDx11Bridge {
 // Inherent helpers used by `blit_input_from_host_scaled` above. Not
 // part of the GpuBridge trait surface.
 impl GlDx11Bridge {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn present_output(
+        &mut self,
+        output_texture: GLuint,
+        target_fbo: GLuint,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+    ) -> bool {
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, target_fbo);
+        if gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+            error!("Host draw framebuffer is incomplete; refusing to present");
+            return false;
+        }
+        if self
+            .present_shader
+            .as_ref()
+            .is_some_and(|shader| !shader.is_valid())
+        {
+            if let Some(shader) = self.present_shader.take() {
+                std::mem::forget(shader);
+            }
+        }
+        if self.present_shader.is_none() {
+            self.present_shader = crate::shader_blit::ShaderBlit::new();
+        }
+        let Some(shader) = self.present_shader.as_ref() else {
+            return false;
+        };
+        while gl::GetError() != gl::NO_ERROR {}
+        shader.present_2d(output_texture, dst_x, dst_y, dst_w, dst_h, bilinear);
+        let error_code = gl::GetError();
+        if error_code != gl::NO_ERROR {
+            error!(error_code, "OpenGL host presentation failed");
+            return false;
+        }
+        true
+    }
+
     /// Try `glBlitFramebuffer` with the host texture attached as
     /// `TEXTURE_2D`; if that fails, fall through to the shader-based
     /// path (same texture, sampleable but not FBO-attachable).
@@ -1079,6 +1094,7 @@ impl GlDx11Bridge {
         input_gl: GLuint,
         dst_w: u32,
         dst_h: u32,
+        uv_scale: (f32, f32),
     ) -> bool {
         let blit = match &self.shader_blit {
             Some(b) => b,
@@ -1096,7 +1112,7 @@ impl GlDx11Bridge {
         gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
 
         // Windows interop is always TEXTURE_2D on both sides.
-        blit.blit_2d(host_texture, dst_w, dst_h);
+        blit.blit_2d(host_texture, dst_w, dst_h, uv_scale);
 
         gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         gl::Flush();
@@ -1122,18 +1138,13 @@ unsafe impl Sync for GlDx11Bridge {}
 
 impl Drop for GlDx11Bridge {
     fn drop(&mut self) {
-        // Only delete GL/WGL resources if a GL context is still current.
-        // During host shutdown (e.g. Resolume exit), the context may already
-        // be destroyed — AMD drivers crash on gl::Delete* without a context.
-        let has_context = unsafe { !gl::GetString(gl::VERSION).is_null() };
-        if has_context {
-            self.cleanup();
-            unsafe {
-                if !self.interop_device.is_null() {
-                    (self.wgl_fns.dx_close_device)(self.interop_device);
-                    self.interop_device = std::ptr::null_mut();
-                }
+        let owns_context = self.is_valid();
+        self.cleanup();
+        unsafe {
+            if owns_context && !self.interop_device.is_null() {
+                (self.wgl_fns.dx_close_device)(self.interop_device);
             }
+            self.interop_device = std::ptr::null_mut();
         }
     }
 }

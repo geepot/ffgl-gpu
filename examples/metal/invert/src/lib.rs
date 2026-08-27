@@ -77,6 +77,12 @@ pub struct Invert {
 unsafe impl Send for Invert {}
 unsafe impl Sync for Invert {}
 
+impl Drop for Invert {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for Invert {
     fn new(inst_data: &FFGLData) -> Self {
         Self {

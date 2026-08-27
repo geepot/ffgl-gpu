@@ -25,9 +25,10 @@ use tracing::{error, warn};
 /// `GL_TEXTURE_RECTANGLE` is not in the `gl` crate's default API on every
 /// platform target combination — declare locally to match the macOS
 /// interop module's convention.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 const GL_TEXTURE_RECTANGLE: GLenum = 0x84F5;
 
-const VERT_SRC: &str = "#version 410 core\n\
+const VERT_SRC: &str = "#version 330 core\n\
 layout(location = 0) in vec2 a_pos;\n\
 out vec2 v_uv;\n\
 void main() {\n\
@@ -35,21 +36,23 @@ void main() {\n\
     v_uv = a_pos * 0.5 + 0.5;\n\
 }\n";
 
-const FRAG_2D: &str = "#version 410 core\n\
+const FRAG_2D: &str = "#version 330 core\n\
 in vec2 v_uv;\n\
 out vec4 frag_color;\n\
 uniform sampler2D u_src;\n\
+uniform vec2 u_uv_scale;\n\
 void main() {\n\
-    frag_color = texture(u_src, v_uv);\n\
+    frag_color = texture(u_src, v_uv * u_uv_scale);\n\
 }\n";
 
-const FRAG_RECT: &str = "#version 410 core\n\
+const FRAG_RECT: &str = "#version 330 core\n\
 in vec2 v_uv;\n\
 out vec4 frag_color;\n\
 uniform sampler2DRect u_src;\n\
 uniform vec2 u_src_size;\n\
+uniform vec2 u_uv_scale;\n\
 void main() {\n\
-    frag_color = texture(u_src, v_uv * u_src_size);\n\
+    frag_color = texture(u_src, v_uv * u_uv_scale * u_src_size);\n\
 }\n";
 
 const QUAD: [f32; 8] = [
@@ -62,7 +65,11 @@ const QUAD: [f32; 8] = [
 pub struct ShaderBlit {
     program_2d: GLuint,
     program_rect: GLuint,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     rect_size_loc: GLint,
+    uv_scale_2d_loc: GLint,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    uv_scale_rect_loc: GLint,
     vao: GLuint,
     vbo: GLuint,
 }
@@ -90,6 +97,15 @@ impl ShaderBlit {
                 gl::DeleteProgram(program_rect);
                 return None;
             }
+            let uv_name = CString::new("u_uv_scale").ok()?;
+            let uv_scale_2d_loc = gl::GetUniformLocation(program_2d, uv_name.as_ptr());
+            let uv_scale_rect_loc = gl::GetUniformLocation(program_rect, uv_name.as_ptr());
+            if uv_scale_2d_loc < 0 || uv_scale_rect_loc < 0 {
+                error!("ShaderBlit: u_uv_scale uniform not found");
+                gl::DeleteProgram(program_2d);
+                gl::DeleteProgram(program_rect);
+                return None;
+            }
 
             let mut vao: GLuint = 0;
             let mut vbo: GLuint = 0;
@@ -112,6 +128,8 @@ impl ShaderBlit {
                 program_2d,
                 program_rect,
                 rect_size_loc,
+                uv_scale_2d_loc,
+                uv_scale_rect_loc,
                 vao,
                 vbo,
             })
@@ -125,8 +143,26 @@ impl ShaderBlit {
     ///
     /// # Safety
     /// A current GL context must be active.
-    pub unsafe fn blit_2d(&self, src_tex: GLuint, dst_w: u32, dst_h: u32) {
-        self.blit_inner(self.program_2d, gl::TEXTURE_2D, src_tex, dst_w, dst_h, |_| {});
+    pub unsafe fn blit_2d(
+        &self,
+        src_tex: GLuint,
+        dst_w: u32,
+        dst_h: u32,
+        uv_scale: (f32, f32),
+    ) {
+        let uv_loc = self.uv_scale_2d_loc;
+        self.blit_inner(
+            self.program_2d,
+            gl::TEXTURE_2D,
+            src_tex,
+            0,
+            0,
+            dst_w,
+            dst_h,
+            false,
+            None,
+            move |_| gl::Uniform2f(uv_loc, uv_scale.0, uv_scale.1),
+        );
     }
 
     /// Sample-and-blit a `GL_TEXTURE_RECTANGLE` source. Rectangle
@@ -135,6 +171,7 @@ impl ShaderBlit {
     ///
     /// # Safety
     /// A current GL context must be active.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub unsafe fn blit_rect(
         &self,
         src_tex: GLuint,
@@ -142,25 +179,107 @@ impl ShaderBlit {
         src_h: u32,
         dst_w: u32,
         dst_h: u32,
+        uv_scale: (f32, f32),
     ) {
         let size_loc = self.rect_size_loc;
+        let uv_loc = self.uv_scale_rect_loc;
         self.blit_inner(
             self.program_rect,
             GL_TEXTURE_RECTANGLE,
             src_tex,
+            0,
+            0,
             dst_w,
             dst_h,
-            move |_| gl::Uniform2f(size_loc, src_w as f32, src_h as f32),
+            false,
+            None,
+            move |_| {
+                gl::Uniform2f(size_loc, src_w as f32, src_h as f32);
+                gl::Uniform2f(uv_loc, uv_scale.0, uv_scale.1);
+            },
         );
     }
 
+    /// Raster-present a 2D texture into a viewport inside the currently bound
+    /// host draw framebuffer. The caller's scissor state is honored.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub unsafe fn present_2d(
+        &self,
+        src_tex: GLuint,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+    ) {
+        self.blit_inner(
+            self.program_2d,
+            gl::TEXTURE_2D,
+            src_tex,
+            dst_x,
+            dst_y,
+            dst_w,
+            dst_h,
+            true,
+            Some(if bilinear { gl::LINEAR } else { gl::NEAREST } as GLint),
+            {
+                let uv_loc = self.uv_scale_2d_loc;
+                move |_| gl::Uniform2f(uv_loc, 1.0, 1.0)
+            },
+        );
+    }
+
+    /// Raster-present a rectangle texture into a viewport inside the
+    /// currently bound host draw framebuffer. The caller's scissor is honored.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub unsafe fn present_rect(
+        &self,
+        src_tex: GLuint,
+        src_w: u32,
+        src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+    ) {
+        let size_loc = self.rect_size_loc;
+        let uv_loc = self.uv_scale_rect_loc;
+        self.blit_inner(
+            self.program_rect,
+            GL_TEXTURE_RECTANGLE,
+            src_tex,
+            dst_x,
+            dst_y,
+            dst_w,
+            dst_h,
+            true,
+            Some(if bilinear { gl::LINEAR } else { gl::NEAREST } as GLint),
+            move |_| {
+                gl::Uniform2f(size_loc, src_w as f32, src_h as f32);
+                gl::Uniform2f(uv_loc, 1.0, 1.0);
+            },
+        );
+    }
+
+    /// Whether this shader's GL names belong to the current context.
+    pub unsafe fn is_valid(&self) -> bool {
+        gl::IsProgram(self.program_2d) != 0 && gl::IsProgram(self.program_rect) != 0
+    }
+
+    #[allow(clippy::too_many_arguments)]
     unsafe fn blit_inner(
         &self,
         program: GLuint,
         src_target: GLenum,
         src_tex: GLuint,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
+        preserve_scissor: bool,
+        texture_filter: Option<GLint>,
         set_extra_uniforms: impl FnOnce(GLuint),
     ) {
         // Snapshot the bits of GL state we touch so we don't surprise
@@ -184,13 +303,30 @@ impl ShaderBlit {
         set_extra_uniforms(program);
         gl::ActiveTexture(gl::TEXTURE0);
         gl::BindTexture(src_target, src_tex);
-        gl::Viewport(0, 0, dst_w as GLsizei, dst_h as GLsizei);
+        let mut previous_filters = None;
+        if let Some(filter) = texture_filter {
+            let mut min_filter = 0;
+            let mut mag_filter = 0;
+            gl::GetTexParameteriv(src_target, gl::TEXTURE_MIN_FILTER, &mut min_filter);
+            gl::GetTexParameteriv(src_target, gl::TEXTURE_MAG_FILTER, &mut mag_filter);
+            gl::TexParameteri(src_target, gl::TEXTURE_MIN_FILTER, filter);
+            gl::TexParameteri(src_target, gl::TEXTURE_MAG_FILTER, filter);
+            previous_filters = Some((min_filter, mag_filter));
+        }
+        gl::Viewport(dst_x, dst_y, dst_w as GLsizei, dst_h as GLsizei);
         gl::Disable(gl::BLEND);
         gl::Disable(gl::DEPTH_TEST);
         gl::Disable(gl::CULL_FACE);
-        gl::Disable(gl::SCISSOR_TEST);
+        if !preserve_scissor {
+            gl::Disable(gl::SCISSOR_TEST);
+        }
         gl::BindVertexArray(self.vao);
         gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+
+        if let Some((min_filter, mag_filter)) = previous_filters {
+            gl::TexParameteri(src_target, gl::TEXTURE_MIN_FILTER, min_filter);
+            gl::TexParameteri(src_target, gl::TEXTURE_MAG_FILTER, mag_filter);
+        }
 
         // Restore.
         gl::BindVertexArray(prev_vao as GLuint);

@@ -67,6 +67,10 @@ pub trait FFGLInstance {
         vec![]
     }
 
+    /// Called when an FFGL 2.x host enables top-left texture orientation for
+    /// this instance. The default preserves legacy bottom-left behavior.
+    fn set_top_left_texture_orientation(&mut self, _enabled: bool) {}
+
     /// Called by [crate::conversions::Op::ProcessOpenGL] to draw the plugin
     fn draw(&mut self, inst_data: &FFGLData, frame_data: GLInput);
 }

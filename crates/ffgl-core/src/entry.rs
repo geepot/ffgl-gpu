@@ -138,7 +138,15 @@ pub fn default_ffgl_entry<H: FFGLHandler + 'static>(
             let cap: Option<PluginCapacity> = num::FromPrimitive::from_u32(cap_num);
 
             let result: FFGLVal = match cap {
-                Some(PluginCapacity::TopLeftTextureOrientation) => SuccessVal::Success.into(),
+                Some(PluginCapacity::TopLeftTextureOrientation) => {
+                    if let Some(inst) = instance {
+                        inst.renderer.set_top_left_texture_orientation(true);
+                        info!("Host enabled top-left texture orientation for this instance");
+                        SuccessVal::Success.into()
+                    } else {
+                        SuccessVal::Fail.into()
+                    }
+                }
                 _ => SuccessVal::Fail.into(),
             };
 

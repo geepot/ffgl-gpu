@@ -2,6 +2,16 @@
 
 use anyhow::Result;
 use gl::types::GLuint;
+use std::time::Duration;
+
+pub(crate) fn is_fresh_previous_frame(
+    last_dispatch_frame: Option<u64>,
+    current_frame: u64,
+    age: Duration,
+) -> bool {
+    last_dispatch_frame.is_some_and(|last| current_frame == last.wrapping_add(1))
+        && age < Duration::from_millis(250)
+}
 
 /// Common interface for GL-to-GPU texture bridging.
 ///
@@ -24,6 +34,7 @@ pub trait GpuBridge {
     /// Copy host OpenGL texture into the bridge's front input texture.
     ///
     /// Returns `false` if setup failed.
+    #[allow(clippy::too_many_arguments)]
     fn blit_input_from_host_scaled(
         &mut self,
         host_texture: GLuint,
@@ -32,16 +43,20 @@ pub trait GpuBridge {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
+        uv_scale: (f32, f32),
     ) -> bool;
 
     /// Copy the back output texture (previous frame result) to the host FBO.
     ///
     /// Returns `false` if setup failed.
+    #[allow(clippy::too_many_arguments)]
     fn blit_back_output_to_target_scaled(
         &mut self,
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -50,11 +65,14 @@ pub trait GpuBridge {
     /// Copy the front output texture (current frame, sync path) to the host FBO.
     ///
     /// Returns `false` if setup failed.
+    #[allow(clippy::too_many_arguments)]
     fn blit_output_to_target_scaled(
         &mut self,
         host_fbo: GLuint,
         src_w: u32,
         src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
@@ -64,10 +82,18 @@ pub trait GpuBridge {
     fn has_result_ready(&self, current_frame: u64) -> bool;
 
     /// Block until the previous frame's GPU work completes. Clears pending state.
-    fn wait_for_previous(&mut self);
+    /// Returns `false` when the GPU reported an error or timed out.
+    fn wait_for_previous(&mut self) -> bool;
 
     /// Block until pending GPU work completes WITHOUT clearing pending state.
-    fn wait_for_pending(&mut self);
+    /// Returns `false` when the GPU reported an error or timed out.
+    fn wait_for_pending(&mut self) -> bool;
+
+    /// Whether the plugin submitted GPU work for the current front buffer.
+    /// Backends that cannot inspect submission state may keep the default.
+    fn has_pending_work(&self) -> bool {
+        true
+    }
 
     /// Swap front/back pairs for double-buffering.
     fn swap(&mut self);
@@ -80,4 +106,33 @@ pub trait GpuBridge {
 
     /// Get current dimensions of the shared textures.
     fn dimensions(&self) -> (u32, u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_fresh_previous_frame;
+    use std::time::Duration;
+
+    #[test]
+    fn accepts_heavy_but_continuous_playback() {
+        assert!(is_fresh_previous_frame(
+            Some(41),
+            42,
+            Duration::from_millis(180)
+        ));
+    }
+
+    #[test]
+    fn rejects_gaps_and_stale_results() {
+        assert!(!is_fresh_previous_frame(
+            Some(40),
+            42,
+            Duration::from_millis(16)
+        ));
+        assert!(!is_fresh_previous_frame(
+            Some(41),
+            42,
+            Duration::from_millis(250)
+        ));
+    }
 }

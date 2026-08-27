@@ -93,6 +93,7 @@ mod metal_impl {
     // because `&'a T` borrows guarantee non-null + outlives-this-call. The
     // one genuinely interesting cast is the `setBytes` block: see the
     // SAFETY comment above that loop.
+    #[allow(clippy::too_many_arguments)]
     fn encode_compute_inner(
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         pipeline: &ComputePipeline,
@@ -796,7 +797,7 @@ mod dx11_impl {
             // Create input layout: POSITION float2 + TEXCOORD float2
             let input_elements = [
                 D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: PCSTR(b"POSITION\0".as_ptr()),
+                    SemanticName: PCSTR(c"POSITION".as_ptr() as *const u8),
                     SemanticIndex: 0,
                     Format: DXGI_FORMAT_R32G32_FLOAT,
                     InputSlot: 0,
@@ -805,7 +806,7 @@ mod dx11_impl {
                     InstanceDataStepRate: 0,
                 },
                 D3D11_INPUT_ELEMENT_DESC {
-                    SemanticName: PCSTR(b"TEXCOORD\0".as_ptr()),
+                    SemanticName: PCSTR(c"TEXCOORD".as_ptr() as *const u8),
                     SemanticIndex: 0,
                     Format: DXGI_FORMAT_R32G32_FLOAT,
                     InputSlot: 0,
@@ -986,8 +987,8 @@ mod dx11_impl {
             grid: (usize, usize),
             threadgroup: (usize, usize),
         ) {
-            let groups_x = ((grid.0 + threadgroup.0 - 1) / threadgroup.0) as u32;
-            let groups_y = ((grid.1 + threadgroup.1 - 1) / threadgroup.1) as u32;
+            let groups_x = grid.0.div_ceil(threadgroup.0) as u32;
+            let groups_y = grid.1.div_ceil(threadgroup.1) as u32;
 
             let ctx = self.device.context();
             unsafe {

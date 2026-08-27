@@ -92,6 +92,12 @@ pub struct DxInvert {
 unsafe impl Send for DxInvert {}
 unsafe impl Sync for DxInvert {}
 
+impl Drop for DxInvert {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for DxInvert {
     fn new(inst_data: &FFGLData) -> Self {
         Self {

@@ -85,6 +85,12 @@ pub struct Passthrough {
 unsafe impl Send for Passthrough {}
 unsafe impl Sync for Passthrough {}
 
+impl Drop for Passthrough {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for Passthrough {
     fn new(inst_data: &FFGLData) -> Self {
         Self {

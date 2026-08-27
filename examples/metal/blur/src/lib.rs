@@ -192,6 +192,12 @@ pub struct Blur {
 unsafe impl Send for Blur {}
 unsafe impl Sync for Blur {}
 
+impl Drop for Blur {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for Blur {
     fn new(inst_data: &FFGLData) -> Self {
         let default_radius = cached_params()[0].default_val();

@@ -432,6 +432,12 @@ pub struct DxKitchenSink {
 unsafe impl Send for DxKitchenSink {}
 unsafe impl Sync for DxKitchenSink {}
 
+impl Drop for DxKitchenSink {
+    fn drop(&mut self) {
+        ffgl_gpu::release_instance_gl_resources(self.instance_id);
+    }
+}
+
 impl SimpleFFGLInstance for DxKitchenSink {
     fn new(inst_data: &FFGLData) -> Self {
         let params_info = cached_params();
