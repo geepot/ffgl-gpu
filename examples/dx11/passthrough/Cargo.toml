@@ -8,7 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ffgl-core = { workspace = true }
-ffgl-glium = { workspace = true }
 ffgl-gpu = { workspace = true }
 gpu-interop = { workspace = true }
 gl = { workspace = true }

@@ -18,17 +18,16 @@
 //! - Expose multiple FFGL parameters.
 
 use std::ffi::CString;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::parameters::{ParamInfo, ParameterTypes, SimpleParamInfo};
 use ffgl_core::{FFGLData, GLInput};
-use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
+use ffgl_gpu::{draw_gpu_effect, AsBytes, DrawInput, GpuContext};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -113,7 +112,7 @@ unsafe impl AsBytes for EffectParams {}
 // GPU state
 // ---------------------------------------------------------------------------
 
-/// Inner GPU state, separate from glium to avoid double-borrow.
+/// GPU pipeline state.
 struct GpuState {
     params: [f32; PARAM_COUNT],
 
@@ -126,8 +125,7 @@ struct GpuState {
     #[cfg(target_os = "windows")]
     tex_after_grayscale: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
     #[cfg(target_os = "windows")]
-    tex_after_grayscale_srv:
-        Option<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>,
+    tex_after_grayscale_srv: Option<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>,
     #[cfg(target_os = "windows")]
     tex_after_grayscale_uav:
         Option<windows::Win32::Graphics::Direct3D11::ID3D11UnorderedAccessView>,
@@ -422,7 +420,6 @@ impl GpuPlugin for GpuState {
 // ---------------------------------------------------------------------------
 
 pub struct DxKitchenSink {
-    glium: FFGLGlium,
     gpu: GpuState,
     frame_counter: u64,
     instance_id: u64,
@@ -439,7 +436,7 @@ impl Drop for DxKitchenSink {
 }
 
 impl SimpleFFGLInstance for DxKitchenSink {
-    fn new(inst_data: &FFGLData) -> Self {
+    fn new(_inst_data: &FFGLData) -> Self {
         let params_info = cached_params();
         let mut params = [0.0f32; PARAM_COUNT];
         for (i, p) in params.iter_mut().enumerate() {
@@ -447,7 +444,6 @@ impl SimpleFFGLInstance for DxKitchenSink {
         }
 
         Self {
-            glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 params,
                 grayscale_pipeline: None,
@@ -508,7 +504,6 @@ impl SimpleFFGLInstance for DxKitchenSink {
         draw_gpu_effect(
             &mut self.gpu,
             id,
-            &mut self.glium,
             data,
             frame_data,
             self.frame_counter,

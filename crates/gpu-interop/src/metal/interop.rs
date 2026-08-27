@@ -23,8 +23,8 @@ use objc2_metal::{
 };
 use objc2_open_gl::{CGLContextObj, CGLError, CGLGetCurrentContext, CGLTexImageIOSurface2D};
 
-use crate::shader_blit::ShaderBlit;
 use crate::bridge::is_fresh_previous_frame;
+use crate::shader_blit::ShaderBlit;
 
 /// How to copy the host's input texture into our shared input texture.
 /// Cached on first call so we don't re-probe every frame.
@@ -78,8 +78,7 @@ impl SharedTexture {
     fn new(device: &ProtocolObject<dyn MTLDevice>, width: u32, height: u32) -> Option<Self> {
         let iosurface = create_iosurface(width, height)?;
         let gl_texture = unsafe { create_gl_texture_from_iosurface(&iosurface, width, height)? };
-        let metal_texture =
-            create_metal_texture_from_iosurface(device, &iosurface, width, height)?;
+        let metal_texture = create_metal_texture_from_iosurface(device, &iosurface, width, height)?;
 
         Some(Self {
             _iosurface: iosurface,
@@ -270,6 +269,11 @@ pub struct GlMetalBridge {
 }
 
 impl GlMetalBridge {
+    /// Stable key for the CGL context currently owned by this thread.
+    pub fn current_context_key() -> usize {
+        unsafe { CGLGetCurrentContext() as usize }
+    }
+
     /// Create an uninitialised bridge.  Call [`GpuBridge::ensure_dimensions`]
     /// before use.
     pub fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
@@ -351,9 +355,7 @@ impl GpuBridge for GlMetalBridge {
     }
 
     fn ensure_dimensions(&mut self, width: u32, height: u32) -> Result<()> {
-        if self.dimensions == (width, height)
-            && self.pairs[0].is_some()
-            && self.pairs[1].is_some()
+        if self.dimensions == (width, height) && self.pairs[0].is_some() && self.pairs[1].is_some()
         {
             return Ok(());
         }
@@ -426,9 +428,7 @@ impl GpuBridge for GlMetalBridge {
                     host_texture,
                     0,
                 );
-                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER)
-                    != gl::FRAMEBUFFER_COMPLETE
-                {
+                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
                     self.input_blit_mode = InputBlitMode::Unknown;
                 }
             }
@@ -443,14 +443,26 @@ impl GpuBridge for GlMetalBridge {
             match self.input_blit_mode {
                 InputBlitMode::Failed => false,
                 InputBlitMode::Unknown => false, // shouldn't happen — probed above
-                InputBlitMode::Fbo(target) => {
-                    self.fbo_blit_input(target, host_texture, input_gl, src_w, src_h, dst_w, dst_h, bilinear)
-                }
-                InputBlitMode::Shader(target) => {
-                    self.shader_blit_input(
-                        target, host_texture, input_gl, src_w, src_h, dst_w, dst_h, uv_scale,
-                    )
-                }
+                InputBlitMode::Fbo(target) => self.fbo_blit_input(
+                    target,
+                    host_texture,
+                    input_gl,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    bilinear,
+                ),
+                InputBlitMode::Shader(target) => self.shader_blit_input(
+                    target,
+                    host_texture,
+                    input_gl,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    uv_scale,
+                ),
             }
         }
     }
@@ -506,15 +518,9 @@ impl GpuBridge for GlMetalBridge {
         self.pending_command_buffer
             .as_ref()
             .is_some_and(|cb| cb.status() != MTLCommandBufferStatus::Error)
-            && self
-                .last_dispatch_time
-                .is_some_and(|time| {
-                    is_fresh_previous_frame(
-                        self.last_dispatch_frame,
-                        current_frame,
-                        time.elapsed(),
-                    )
-                })
+            && self.last_dispatch_time.is_some_and(|time| {
+                is_fresh_previous_frame(self.last_dispatch_frame, current_frame, time.elapsed())
+            })
     }
 
     fn wait_for_previous(&mut self) -> bool {
@@ -575,9 +581,8 @@ impl GpuBridge for GlMetalBridge {
         self.front = 0;
         self.last_dispatch_frame = None;
         self.last_dispatch_time = None;
-        let owns_context = unsafe {
-            !self.owner_ctx.is_null() && CGLGetCurrentContext() == self.owner_ctx
-        };
+        let owns_context =
+            unsafe { !self.owner_ctx.is_null() && CGLGetCurrentContext() == self.owner_ctx };
         if owns_context {
             unsafe {
                 if self.read_fbo != 0 {
@@ -589,9 +594,9 @@ impl GpuBridge for GlMetalBridge {
             }
         } else {
             if let Some(shader) = self.shader_blit.take() {
-            // ShaderBlit::drop deletes context-local GL names. In a foreign
-            // context, intentionally leak those names rather than deleting
-            // unrelated host objects that reused the same numeric IDs.
+                // ShaderBlit::drop deletes context-local GL names. In a foreign
+                // context, intentionally leak those names rather than deleting
+                // unrelated host objects that reused the same numeric IDs.
                 std::mem::forget(shader);
             }
             if let Some(shader) = self.present_shader.take() {
@@ -723,7 +728,11 @@ impl GlMetalBridge {
         // queries returned a meaningful internal format, the texture
         // is bound to that target; otherwise default to TEXTURE_2D
         // (the common case for compressed video sources on macOS).
-        let target = if iformat != 0 { gl::TEXTURE_2D } else { GL_TEXTURE_RECTANGLE };
+        let target = if iformat != 0 {
+            gl::TEXTURE_2D
+        } else {
+            GL_TEXTURE_RECTANGLE
+        };
         InputBlitMode::Shader(target)
     }
 
@@ -766,8 +775,14 @@ impl GlMetalBridge {
 
         let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
         gl::BlitFramebuffer(
-            0, 0, src_w as GLsizei, src_h as GLsizei,
-            0, 0, dst_w as GLsizei, dst_h as GLsizei,
+            0,
+            0,
+            src_w as GLsizei,
+            src_h as GLsizei,
+            0,
+            0,
+            dst_w as GLsizei,
+            dst_h as GLsizei,
             gl::COLOR_BUFFER_BIT,
             filter,
         );

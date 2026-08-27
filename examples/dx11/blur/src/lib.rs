@@ -7,17 +7,16 @@
 //! 0-20 pixels of blur.
 
 use std::ffi::CString;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::parameters::{ParamInfo, SimpleParamInfo};
 use ffgl_core::{FFGLData, GLInput};
-use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
+use ffgl_gpu::{draw_gpu_effect, AsBytes, DrawInput, GpuContext};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -66,7 +65,7 @@ struct BlurParams {
 // SAFETY: BlurParams is #[repr(C)] with only plain numeric fields.
 unsafe impl AsBytes for BlurParams {}
 
-/// Inner GPU state, separate from glium to avoid double-borrow.
+/// GPU pipeline state.
 struct GpuState {
     radius_param: f32,
     h_pipeline: Option<ComputePipeline>,
@@ -87,12 +86,7 @@ struct GpuState {
 impl GpuState {
     /// Create or re-create the intermediate texture (and SRV/UAV views) when
     /// dimensions change.
-    fn ensure_intermediate_texture(
-        &mut self,
-        device: &ID3D11Device,
-        width: u32,
-        height: u32,
-    ) {
+    fn ensure_intermediate_texture(&mut self, device: &ID3D11Device, width: u32, height: u32) {
         if self.intermediate_dims == (width, height) && self.intermediate_texture.is_some() {
             return;
         }
@@ -136,11 +130,7 @@ impl GpuState {
         };
         let mut srv = None;
         let hr = unsafe {
-            device.CreateShaderResourceView(
-                &texture,
-                Some(&srv_desc),
-                Some(&mut srv as *mut _),
-            )
+            device.CreateShaderResourceView(&texture, Some(&srv_desc), Some(&mut srv as *mut _))
         };
         if hr.is_err() {
             return;
@@ -156,11 +146,7 @@ impl GpuState {
         };
         let mut uav = None;
         let hr = unsafe {
-            device.CreateUnorderedAccessView(
-                &texture,
-                Some(&uav_desc),
-                Some(&mut uav as *mut _),
-            )
+            device.CreateUnorderedAccessView(&texture, Some(&uav_desc), Some(&mut uav as *mut _))
         };
         if hr.is_err() {
             return;
@@ -182,13 +168,7 @@ impl GpuState {
         };
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            let hr = context.Map(
-                cbuf,
-                0,
-                D3D11_MAP_WRITE_DISCARD,
-                0,
-                Some(&mut mapped),
-            );
+            let hr = context.Map(cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped));
             if hr.is_err() {
                 return;
             }
@@ -305,7 +285,6 @@ unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
 pub struct DxBlur {
-    glium: FFGLGlium,
     gpu: GpuState,
     frame_counter: u64,
     instance_id: u64,
@@ -322,10 +301,9 @@ impl Drop for DxBlur {
 }
 
 impl SimpleFFGLInstance for DxBlur {
-    fn new(inst_data: &FFGLData) -> Self {
+    fn new(_inst_data: &FFGLData) -> Self {
         let default_radius = cached_params()[0].default_val();
         Self {
-            glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 radius_param: default_radius,
                 h_pipeline: None,
@@ -379,7 +357,6 @@ impl SimpleFFGLInstance for DxBlur {
         draw_gpu_effect(
             &mut self.gpu,
             id,
-            &mut self.glium,
             data,
             frame_data,
             self.frame_counter,

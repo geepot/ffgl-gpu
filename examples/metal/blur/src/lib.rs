@@ -6,17 +6,16 @@
 //! 0-20 pixels of blur.
 
 use std::ffi::CString;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::parameters::{ParamInfo, SimpleParamInfo};
 use ffgl_core::{FFGLData, GLInput};
-use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::ComputePipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
+use ffgl_gpu::{draw_gpu_effect, AsBytes, DrawInput, GpuContext};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -50,7 +49,7 @@ struct BlurParams {
 // SAFETY: BlurParams is #[repr(C)] with only plain numeric fields.
 unsafe impl AsBytes for BlurParams {}
 
-/// Inner GPU state, separate from glium to avoid double-borrow.
+/// GPU pipeline state.
 struct GpuState {
     radius_param: f32,
     h_pipeline: Option<ComputePipeline>,
@@ -167,7 +166,9 @@ impl GpuPlugin for GpuState {
 
             // Single commit for both passes.
             let pending = ctx.commit(cb);
-            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
+            input
+                .metal_bridge()
+                .store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -182,7 +183,6 @@ unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
 pub struct Blur {
-    glium: FFGLGlium,
     gpu: GpuState,
     frame_counter: u64,
     instance_id: u64,
@@ -199,10 +199,9 @@ impl Drop for Blur {
 }
 
 impl SimpleFFGLInstance for Blur {
-    fn new(inst_data: &FFGLData) -> Self {
+    fn new(_inst_data: &FFGLData) -> Self {
         let default_radius = cached_params()[0].default_val();
         Self {
-            glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 radius_param: default_radius,
                 h_pipeline: None,
@@ -249,7 +248,6 @@ impl SimpleFFGLInstance for Blur {
         draw_gpu_effect(
             &mut self.gpu,
             id,
-            &mut self.glium,
             data,
             frame_data,
             self.frame_counter,

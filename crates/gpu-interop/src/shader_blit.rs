@@ -22,6 +22,17 @@ use std::ffi::CString;
 use std::ptr;
 use tracing::{error, warn};
 
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn current_gl_context_key() -> usize {
+    unsafe { objc2_open_gl::CGLGetCurrentContext() as usize }
+}
+
+#[cfg(target_os = "windows")]
+fn current_gl_context_key() -> usize {
+    unsafe { windows::Win32::Graphics::OpenGL::wglGetCurrentContext().0 as usize }
+}
+
 /// `GL_TEXTURE_RECTANGLE` is not in the `gl` crate's default API on every
 /// platform target combination — declare locally to match the macOS
 /// interop module's convention.
@@ -55,12 +66,7 @@ void main() {\n\
     frag_color = texture(u_src, v_uv * u_uv_scale * u_src_size);\n\
 }\n";
 
-const QUAD: [f32; 8] = [
-    -1.0, -1.0,
-     1.0, -1.0,
-    -1.0,  1.0,
-     1.0,  1.0,
-];
+const QUAD: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
 
 pub struct ShaderBlit {
     program_2d: GLuint,
@@ -72,6 +78,7 @@ pub struct ShaderBlit {
     uv_scale_rect_loc: GLint,
     vao: GLuint,
     vbo: GLuint,
+    owner_context: usize,
 }
 
 impl ShaderBlit {
@@ -132,6 +139,7 @@ impl ShaderBlit {
                 uv_scale_rect_loc,
                 vao,
                 vbo,
+                owner_context: current_gl_context_key(),
             })
         }
     }
@@ -143,13 +151,7 @@ impl ShaderBlit {
     ///
     /// # Safety
     /// A current GL context must be active.
-    pub unsafe fn blit_2d(
-        &self,
-        src_tex: GLuint,
-        dst_w: u32,
-        dst_h: u32,
-        uv_scale: (f32, f32),
-    ) {
+    pub unsafe fn blit_2d(&self, src_tex: GLuint, dst_w: u32, dst_h: u32, uv_scale: (f32, f32)) {
         let uv_loc = self.uv_scale_2d_loc;
         self.blit_inner(
             self.program_2d,
@@ -202,6 +204,10 @@ impl ShaderBlit {
 
     /// Raster-present a 2D texture into a viewport inside the currently bound
     /// host draw framebuffer. The caller's scissor state is honored.
+    ///
+    /// # Safety
+    /// A compatible GL context must be current and `src_tex` must name a live
+    /// `GL_TEXTURE_2D` in that context.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub unsafe fn present_2d(
         &self,
@@ -211,6 +217,27 @@ impl ShaderBlit {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
+    ) {
+        self.present_2d_scaled(src_tex, dst_x, dst_y, dst_w, dst_h, bilinear, (1.0, 1.0));
+    }
+
+    /// Raster-present a 2D texture while sampling only its valid content
+    /// region. This is used for FFGL textures whose hardware allocation is
+    /// padded beyond the logical Width/Height.
+    ///
+    /// # Safety
+    /// A compatible GL context must be current and `src_tex` must name a live
+    /// `GL_TEXTURE_2D` in that context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn present_2d_scaled(
+        &self,
+        src_tex: GLuint,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+        uv_scale: (f32, f32),
     ) {
         self.blit_inner(
             self.program_2d,
@@ -224,13 +251,17 @@ impl ShaderBlit {
             Some(if bilinear { gl::LINEAR } else { gl::NEAREST } as GLint),
             {
                 let uv_loc = self.uv_scale_2d_loc;
-                move |_| gl::Uniform2f(uv_loc, 1.0, 1.0)
+                move |_| gl::Uniform2f(uv_loc, uv_scale.0, uv_scale.1)
             },
         );
     }
 
     /// Raster-present a rectangle texture into a viewport inside the
     /// currently bound host draw framebuffer. The caller's scissor is honored.
+    ///
+    /// # Safety
+    /// A compatible GL context must be current and `src_tex` must name a live
+    /// `GL_TEXTURE_RECTANGLE` in that context.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub unsafe fn present_rect(
@@ -243,6 +274,39 @@ impl ShaderBlit {
         dst_w: u32,
         dst_h: u32,
         bilinear: bool,
+    ) {
+        self.present_rect_scaled(
+            src_tex,
+            src_w,
+            src_h,
+            dst_x,
+            dst_y,
+            dst_w,
+            dst_h,
+            bilinear,
+            (1.0, 1.0),
+        );
+    }
+
+    /// Raster-present a rectangle texture while sampling only its valid
+    /// logical content region.
+    ///
+    /// # Safety
+    /// A compatible GL context must be current and `src_tex` must name a live
+    /// `GL_TEXTURE_RECTANGLE` in that context.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub unsafe fn present_rect_scaled(
+        &self,
+        src_tex: GLuint,
+        src_w: u32,
+        src_h: u32,
+        dst_x: i32,
+        dst_y: i32,
+        dst_w: u32,
+        dst_h: u32,
+        bilinear: bool,
+        uv_scale: (f32, f32),
     ) {
         let size_loc = self.rect_size_loc;
         let uv_loc = self.uv_scale_rect_loc;
@@ -258,14 +322,19 @@ impl ShaderBlit {
             Some(if bilinear { gl::LINEAR } else { gl::NEAREST } as GLint),
             move |_| {
                 gl::Uniform2f(size_loc, src_w as f32, src_h as f32);
-                gl::Uniform2f(uv_loc, 1.0, 1.0);
+                gl::Uniform2f(uv_loc, uv_scale.0, uv_scale.1);
             },
         );
     }
 
     /// Whether this shader's GL names belong to the current context.
+    ///
+    /// # Safety
+    /// A GL context must be current.
     pub unsafe fn is_valid(&self) -> bool {
-        gl::IsProgram(self.program_2d) != 0 && gl::IsProgram(self.program_rect) != 0
+        current_gl_context_key() == self.owner_context
+            && gl::IsProgram(self.program_2d) != 0
+            && gl::IsProgram(self.program_rect) != 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -356,6 +425,9 @@ impl ShaderBlit {
 
 impl Drop for ShaderBlit {
     fn drop(&mut self) {
+        if current_gl_context_key() != self.owner_context {
+            return;
+        }
         unsafe {
             gl::DeleteProgram(self.program_2d);
             gl::DeleteProgram(self.program_rect);
@@ -386,12 +458,7 @@ unsafe fn compile_shader(stage: GLenum, src: &str) -> Option<GLuint> {
     }
     let csrc = CString::new(src).ok()?;
     let lengths: GLint = csrc.as_bytes().len() as GLint;
-    gl::ShaderSource(
-        shader,
-        1,
-        &csrc.as_ptr() as *const *const GLchar,
-        &lengths,
-    );
+    gl::ShaderSource(shader, 1, &csrc.as_ptr() as *const *const GLchar, &lengths);
     gl::CompileShader(shader);
 
     let mut status: GLint = 0;

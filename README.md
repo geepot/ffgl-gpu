@@ -26,11 +26,9 @@ Plugins built with this framework work in any FFGL 2.2 host: Resolume Arena/Aven
 
 ```
 ffgl-core          (no GPU deps — pure FFGL protocol)
-  ^
-ffgl-glium         (OpenGL abstraction via glium)
-  ^
-gpu-interop        (Metal/DX11 ↔ GL texture sharing)
-  ^
+├── ffgl-glium     (optional OpenGL abstraction via glium)
+└── gpu-interop    (Metal/DX11 ↔ GL texture sharing)
+      ^
 ffgl-gpu           (ties it all together: context, pipelines, draw loop)
   ^
 examples/*         (your plugins go here)
@@ -184,8 +182,8 @@ impl SimpleFFGLInstance for MyPlugin {
     }
 
     fn draw(&mut self, data: &FFGLData, frame_data: GLInput) {
-        draw_gpu_effect(&mut self.gpu, self.instance_id, &mut self.glium,
-            data, frame_data, self.frame_counter, 1.0, 1.0, METALLIB_BYTES);
+        draw_gpu_effect(&mut self.gpu, self.instance_id, data, frame_data,
+            self.frame_counter, 1.0, 1.0, METALLIB_BYTES);
     }
 }
 
@@ -193,6 +191,10 @@ ffgl_core::plugin_main!(SimpleFFGLHandler<MyPlugin>);
 ```
 
 See the `examples/` directory for complete working implementations.
+
+`ffgl-gpu` 1.0 removes the `FFGLGlium` argument and dependency from its draw
+loop. Existing plugins should delete their cached `FFGLGlium` field and pass
+`data` immediately after `instance_id`, as shown above.
 
 ## Examples
 

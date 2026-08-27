@@ -1,7 +1,7 @@
 //! High-level FFGL GPU plugin framework.
 //!
-//! This crate ties together [`ffgl_core`] (host protocol), [`ffgl_glium`]
-//! (OpenGL context), and [`gpu_interop`] (GL-to-Metal/DX11 bridging) into a
+//! This crate ties together [`ffgl_core`] (host protocol) and [`gpu_interop`]
+//! (GL-to-Metal/DX11 bridging) into a
 //! single framework for writing GPU-accelerated FFGL plugins.
 //!
 //! # Overview

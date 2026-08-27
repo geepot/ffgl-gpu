@@ -17,15 +17,11 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::OpenGL::*;
 
-use crate::GpuBridge;
 use crate::bridge::is_fresh_previous_frame;
+use crate::GpuBridge;
 
 /// WGL_NV_DX_interop2 constants.
 const WGL_ACCESS_READ_WRITE_NV: GLenum = 0x0001;
-
-/// Number of GPU query slots in the ring buffer. Allows draining older queries
-/// (which are already complete) before checking the latest, reducing spin time.
-const PIPELINE_DEPTH: usize = 3;
 
 // ---------------------------------------------------------------------------
 // WGL function pointer types
@@ -316,15 +312,8 @@ impl SharedTexturePair {
 pub struct GlDx11Bridge {
     /// Reference to the D3D11 device (for texture creation).
     device: ID3D11Device,
-    /// Reference to the immediate context (for GPU sync queries).
+    /// Reference to the immediate context (for command submission and flushes).
     context: ID3D11DeviceContext,
-    /// Ring buffer of GPU sync queries. Draining oldest-first avoids spinning
-    /// on the most recent query (which may not be complete yet).
-    gpu_queries: [ID3D11Query; PIPELINE_DEPTH],
-    /// Total dispatches issued (monotonic counter, used as ring index).
-    dispatch_count: u64,
-    /// Number of queries not yet confirmed complete (0..PIPELINE_DEPTH).
-    pending_queries: u32,
     /// Loaded WGL interop function pointers.
     wgl_fns: WglInteropFunctions,
     /// WGL interop device handle from wglDXOpenDeviceNV.
@@ -372,14 +361,16 @@ enum Dx11InputBlitMode {
 }
 
 impl GlDx11Bridge {
-    /// Create a new GL-D3D11 bridge. The D3D11 device, context, and query are
+    /// Stable key for the WGL context currently owned by this thread.
+    pub fn current_context_key() -> usize {
+        unsafe { wglGetCurrentContext().0 as usize }
+    }
+
+    /// Create a new GL-D3D11 bridge. The D3D11 device and context are
     /// borrowed (cloned COM references) from a [`Dx11Device`](super::Dx11Device).
     ///
     /// Returns `None` if WGL_NV_DX_interop2 is not available.
-    pub fn new(
-        device: &ID3D11Device,
-        context: &ID3D11DeviceContext,
-    ) -> Option<Self> {
+    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Option<Self> {
         let wgl_fns = WglInteropFunctions::load()?;
 
         // Open the D3D11 device for WGL interop
@@ -393,21 +384,11 @@ impl GlDx11Bridge {
             return None;
         }
 
-        // Create ring buffer of GPU sync queries
-        let gpu_queries = [
-            super::device::create_event_query(device)?,
-            super::device::create_event_query(device)?,
-            super::device::create_event_query(device)?,
-        ];
-
         debug!("GL-D3D11 interop bridge initialized via WGL_NV_DX_interop2");
 
         Some(Self {
             device: device.clone(),
             context: context.clone(),
-            gpu_queries,
-            dispatch_count: 0,
-            pending_queries: 0,
             wgl_fns,
             interop_device,
             pairs: [None, None],
@@ -494,12 +475,6 @@ impl GlDx11Bridge {
         &self.context
     }
 
-    /// Borrow the GPU event query for the current ring buffer slot.
-    pub fn query(&self) -> &ID3D11Query {
-        let slot = (self.dispatch_count % PIPELINE_DEPTH as u64) as usize;
-        &self.gpu_queries[slot]
-    }
-
     /// Check whether the bridge FBO handles are still valid.
     pub fn is_valid(&self) -> bool {
         unsafe { wglGetCurrentContext().0 == self.owner_ctx }
@@ -527,8 +502,7 @@ impl GlDx11Bridge {
         };
 
         let mut handles = [pair.input.interop_handle];
-        let result =
-            (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
+        let result = (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
         result != 0
     }
 
@@ -554,8 +528,7 @@ impl GlDx11Bridge {
         };
 
         let mut handles = [pair.output.interop_handle];
-        let result =
-            (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
+        let result = (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
         result != 0
     }
 
@@ -579,87 +552,46 @@ impl GlDx11Bridge {
         };
 
         let mut handles = [pair.output.interop_handle];
-        let result =
-            (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
+        let result = (self.wgl_fns.dx_unlock_objects)(self.interop_device, 1, handles.as_mut_ptr());
         result != 0
     }
 
-    // -- GPU query polling ----------------------------------------------------
-
-    /// Non-blocking check of the oldest pending GPU query.
-    /// Returns true if the oldest query is complete (or no queries are pending).
-    /// Uses DONOTFLUSH to avoid redundant driver flushes during polling.
-    fn poll_oldest_query(&self) -> bool {
-        if self.pending_queries == 0 {
+    /// Acquire and release every registered object before resize or teardown.
+    /// WGL_NV_DX_interop lock/unlock is the ownership-transfer boundary, so
+    /// batching all handles prevents unregistering an object that the D3D
+    /// queue or GL driver still owns.
+    fn synchronize_registered_resources(&self) -> bool {
+        let mut handles = Vec::with_capacity(4);
+        for pair in self.pairs.iter().flatten() {
+            handles.push(pair.input.interop_handle);
+            handles.push(pair.output.interop_handle);
+        }
+        if handles.is_empty() {
             return true;
         }
-        let oldest_slot =
-            ((self.dispatch_count - self.pending_queries as u64) % PIPELINE_DEPTH as u64) as usize;
-        let mut done: u32 = 0;
+
         unsafe {
-            // D3D11_ASYNC_GETDATA_DONOTFLUSH (1): don't flush the pipeline on each poll.
-            // We already call Flush() after dispatch, so redundant flushes waste time.
-            let _ = self.context.GetData(
-                &self.gpu_queries[oldest_slot],
-                Some(&mut done as *mut u32 as *mut GLvoid),
-                std::mem::size_of::<u32>() as u32,
-                1,
-            );
-        }
-        done != 0
-    }
-
-    /// Wait for all pending D3D11 dispatches to complete, draining oldest-first.
-    /// Older queries (2+ frames ago) are typically already complete, making their
-    /// checks instantaneous and reducing total spin time on the most recent query.
-    fn wait_for_gpu(&mut self) -> bool {
-        if self.pending_queries == 0 {
-            return true;
-        }
-        let start = Instant::now();
-        while self.pending_queries > 0 {
-            if self.poll_oldest_query() {
-                self.pending_queries -= 1;
-            } else if start.elapsed().as_millis() > 100 {
-                warn!("GPU query timed out after 100ms, proceeding anyway");
-                self.pending_queries = 0;
+            self.context.Flush();
+            if (self.wgl_fns.dx_lock_objects)(
+                self.interop_device,
+                handles.len() as GLint,
+                handles.as_mut_ptr(),
+            ) == 0
+            {
+                error!("Failed to acquire WGL interop resources before teardown");
                 return false;
-            } else {
-                std::thread::yield_now();
+            }
+            if (self.wgl_fns.dx_unlock_objects)(
+                self.interop_device,
+                handles.len() as GLint,
+                handles.as_mut_ptr(),
+            ) == 0
+            {
+                error!("Failed to release WGL interop resources before teardown");
+                return false;
             }
         }
         true
-    }
-
-    /// Wait for the most recent D3D11 dispatch WITHOUT clearing pending state.
-    /// Used in the synchronous fallback path (first frame / after gap) so that
-    /// `has_result_ready()` still returns true on the next frame, enabling pipelining.
-    fn wait_for_gpu_pending(&self) -> bool {
-        if self.pending_queries == 0 {
-            return true;
-        }
-        // Wait for the latest query (most recently issued dispatch)
-        let latest_slot = ((self.dispatch_count - 1) % PIPELINE_DEPTH as u64) as usize;
-        let start = Instant::now();
-        loop {
-            let mut done: u32 = 0;
-            unsafe {
-                let _ = self.context.GetData(
-                    &self.gpu_queries[latest_slot],
-                    Some(&mut done as *mut u32 as *mut GLvoid),
-                    std::mem::size_of::<u32>() as u32,
-                    1,
-                );
-            }
-            if done != 0 {
-                return true;
-            }
-            if start.elapsed().as_millis() > 100 {
-                warn!("GPU query timed out after 100ms, proceeding anyway");
-                return false;
-            }
-            std::thread::yield_now();
-        }
     }
 
     /// Unregister all shared textures and drop the pairs.
@@ -682,15 +614,17 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn ensure_dimensions(&mut self, width: u32, height: u32) -> Result<()> {
-        if self.dimensions == (width, height)
-            && self.pairs[0].is_some()
-            && self.pairs[1].is_some()
+        if self.dimensions == (width, height) && self.pairs[0].is_some() && self.pairs[1].is_some()
         {
             return Ok(());
         }
 
-        // Dimension change: wait for any in-flight work before destroying textures
+        // Dimension change: wait for compute and transfer ownership of every
+        // registered resource before unregistering or destroying it.
         let _ = self.wait_for_previous();
+        if !self.synchronize_registered_resources() {
+            bail!("Failed to synchronize WGL interop resources before resize");
+        }
 
         // Clean up old pairs (unregister from interop first)
         self.destroy_pairs();
@@ -772,9 +706,7 @@ impl GpuBridge for GlDx11Bridge {
                     host_texture,
                     0,
                 );
-                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER)
-                    != gl::FRAMEBUFFER_COMPLETE
-                {
+                if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
                     self.input_blit_mode = Dx11InputBlitMode::Unknown;
                 }
             }
@@ -793,7 +725,13 @@ impl GpuBridge for GlDx11Bridge {
                 Dx11InputBlitMode::Failed => false,
                 Dx11InputBlitMode::Unknown => false,
                 Dx11InputBlitMode::Fbo => self.dx11_fbo_blit_input(
-                    host_texture, input_gl, src_w, src_h, dst_w, dst_h, bilinear,
+                    host_texture,
+                    input_gl,
+                    src_w,
+                    src_h,
+                    dst_w,
+                    dst_h,
+                    bilinear,
                 ),
                 Dx11InputBlitMode::Shader => {
                     self.dx11_shader_blit_input(host_texture, input_gl, dst_w, dst_h, uv_scale)
@@ -801,8 +739,11 @@ impl GpuBridge for GlDx11Bridge {
             }
         };
 
-        unsafe { self.unlock_gl_texture_front_input() };
-        result
+        let unlocked = unsafe { self.unlock_gl_texture_front_input() };
+        if !unlocked {
+            error!("Failed to unlock front input GL texture after input blit");
+        }
+        result && unlocked
     }
 
     fn blit_back_output_to_target_scaled(
@@ -875,20 +816,19 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn has_result_ready(&self, current_frame: u64) -> bool {
-        self.pending_queries > 0
-            && is_fresh_previous_frame(
-                self.last_dispatch_frame,
-                current_frame,
-                self.last_dispatch_time.elapsed(),
-            )
+        is_fresh_previous_frame(
+            self.last_dispatch_frame,
+            current_frame,
+            self.last_dispatch_time.elapsed(),
+        )
     }
 
     fn wait_for_previous(&mut self) -> bool {
-        self.wait_for_gpu()
+        true
     }
 
     fn wait_for_pending(&mut self) -> bool {
-        self.wait_for_gpu_pending()
+        true
     }
 
     fn swap(&mut self) {
@@ -896,19 +836,18 @@ impl GpuBridge for GlDx11Bridge {
     }
 
     fn mark_dispatch(&mut self, frame: u64) {
-        let slot = (self.dispatch_count % PIPELINE_DEPTH as u64) as usize;
         unsafe {
-            self.context.End(&self.gpu_queries[slot]);
+            // The subsequent WGL interop lock on this exact output is the
+            // extension-defined D3D-to-GL completion/ownership boundary.
+            self.context.Flush();
         }
-        self.dispatch_count += 1;
-        self.pending_queries = (self.pending_queries + 1).min(PIPELINE_DEPTH as u32);
         self.last_dispatch_frame = Some(frame);
         self.last_dispatch_time = Instant::now();
     }
 
     fn cleanup(&mut self) {
         if self.is_valid() {
-            let _ = self.wait_for_gpu();
+            let _ = self.synchronize_registered_resources();
         }
         self.destroy_pairs();
         self.front = 0;
@@ -1003,10 +942,8 @@ impl GlDx11Bridge {
             0,
         );
         if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
             return Dx11InputBlitMode::Fbo;
         }
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
 
         // FBO probe failed — log the format for diagnosis and fall
         // through to the shader path.
@@ -1072,13 +1009,18 @@ impl GlDx11Bridge {
 
         let filter = if bilinear { gl::LINEAR } else { gl::NEAREST };
         gl::BlitFramebuffer(
-            0, 0, src_w as GLsizei, src_h as GLsizei,
-            0, 0, dst_w as GLsizei, dst_h as GLsizei,
+            0,
+            0,
+            src_w as GLsizei,
+            src_h as GLsizei,
+            0,
+            0,
+            dst_w as GLsizei,
+            dst_h as GLsizei,
             gl::COLOR_BUFFER_BIT,
             filter,
         );
 
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         gl::Flush();
         true
     }
@@ -1114,7 +1056,6 @@ impl GlDx11Bridge {
         // Windows interop is always TEXTURE_2D on both sides.
         blit.blit_2d(host_texture, dst_w, dst_h, uv_scale);
 
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         gl::Flush();
         true
     }

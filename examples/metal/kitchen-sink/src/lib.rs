@@ -17,17 +17,16 @@
 //! - Expose multiple FFGL parameters.
 
 use std::ffi::CString;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::parameters::{ParamInfo, ParameterTypes, SimpleParamInfo};
 use ffgl_core::{FFGLData, GLInput};
-use ffgl_glium::FFGLGlium;
 use ffgl_gpu::pipeline::{ComputePipeline, RenderPipeline};
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{AsBytes, DrawInput, GpuContext, draw_gpu_effect};
+use ffgl_gpu::{draw_gpu_effect, AsBytes, DrawInput, GpuContext};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -90,7 +89,7 @@ struct EffectParams {
 // SAFETY: EffectParams is #[repr(C)] with only plain f32 fields.
 unsafe impl AsBytes for EffectParams {}
 
-/// Inner GPU state, separate from glium to avoid double-borrow.
+/// GPU pipeline state.
 struct GpuState {
     params: [f32; PARAM_COUNT],
 
@@ -260,7 +259,9 @@ impl GpuPlugin for GpuState {
 
             // Single commit — all three passes submitted as one GPU unit.
             let pending = ctx.commit(cb);
-            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
+            input
+                .metal_bridge()
+                .store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -271,7 +272,6 @@ impl GpuPlugin for GpuState {
 }
 
 pub struct KitchenSink {
-    glium: FFGLGlium,
     gpu: GpuState,
     frame_counter: u64,
     instance_id: u64,
@@ -288,7 +288,7 @@ impl Drop for KitchenSink {
 }
 
 impl SimpleFFGLInstance for KitchenSink {
-    fn new(inst_data: &FFGLData) -> Self {
+    fn new(_inst_data: &FFGLData) -> Self {
         let params_info = cached_params();
         let mut params = [0.0f32; PARAM_COUNT];
         for (i, p) in params.iter_mut().enumerate() {
@@ -296,7 +296,6 @@ impl SimpleFFGLInstance for KitchenSink {
         }
 
         Self {
-            glium: FFGLGlium::new(inst_data),
             gpu: GpuState {
                 params,
                 grayscale_pipeline: None,
@@ -348,7 +347,6 @@ impl SimpleFFGLInstance for KitchenSink {
         draw_gpu_effect(
             &mut self.gpu,
             id,
-            &mut self.glium,
             data,
             frame_data,
             self.frame_counter,

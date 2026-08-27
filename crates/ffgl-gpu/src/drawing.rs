@@ -16,13 +16,13 @@
 // `metal_draw` / `dx11_draw` submodules below; gate those imports so they
 // don't warn-as-unused on a non-mac, non-windows host build (e.g. the
 // Linux Docker container compiling ffgl-gpu as a build-dep).
-use crate::plugin::GpuPlugin;
-use ffgl_core::inputs::GLInput;
-use ffgl_core::FFGLData;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::context::GpuContext;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::plugin::DrawInput;
+use crate::plugin::GpuPlugin;
+use ffgl_core::inputs::GLInput;
+use ffgl_core::FFGLData;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use gl::types::{GLenum, GLint, GLuint};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -32,7 +32,61 @@ use std::cell::RefCell;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::collections::{HashMap, HashSet};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::{LazyLock, Mutex, Once};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::time::{Duration, Instant};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tracing::error;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static PENDING_RELEASES: LazyLock<Mutex<HashMap<u64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const RELEASE_TTL: Duration = Duration::from_secs(60);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static GL_INIT: Once = Once::new();
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static PIPELINE_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn ensure_gl_loaded() {
+    GL_INIT.call_once(|| {
+        gl_loader::init_gl();
+        gl::load_with(|symbol| gl_loader::get_proc_address(symbol).cast());
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn pending_release_snapshot() -> Vec<u64> {
+    let mut pending = PENDING_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.retain(|_, queued| queued.elapsed() < RELEASE_TTL);
+    pending.keys().copied().collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn queue_release(instance_id: u64) {
+    PENDING_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(instance_id, Instant::now());
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn log_pipeline_fallback_once() {
+    if !PIPELINE_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        error!(
+            "FFGL GPU pipeline failed; presenting the unprocessed input instead. \
+             Report this if the host shows unprocessed, black, or flickering frames"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GL state save / restore
@@ -135,7 +189,8 @@ impl SavedGlState {
             s.texture_2d_unit0 = s.texture_2d_active;
             s.texture_rectangle_unit0 = s.texture_rectangle_active;
         }
-        s.sampler_objects_supported = gl::GetIntegeri_v::is_loaded() && gl::BindSampler::is_loaded();
+        s.sampler_objects_supported =
+            gl::GetIntegeri_v::is_loaded() && gl::BindSampler::is_loaded();
         if s.sampler_objects_supported {
             gl::GetIntegeri_v(gl::SAMPLER_BINDING, 0, &mut s.sampler_unit0);
         }
@@ -282,9 +337,7 @@ unsafe fn set_enabled(capability: GLenum, enabled: bool) {
 // ---------------------------------------------------------------------------
 
 fn clear_gl_errors() {
-    unsafe {
-        while gl::GetError() != gl::NO_ERROR {}
-    }
+    unsafe { while gl::GetError() != gl::NO_ERROR {} }
 }
 
 fn is_context_current() -> bool {
@@ -299,7 +352,12 @@ fn resolve_output_viewport(live: [i32; 4], cached: [i32; 4]) -> [i32; 4] {
     }
 }
 
-fn content_uv_scale(width: u32, height: u32, hardware_width: u32, hardware_height: u32) -> (f32, f32) {
+fn content_uv_scale(
+    width: u32,
+    height: u32,
+    hardware_width: u32,
+    hardware_height: u32,
+) -> (f32, f32) {
     (
         if hardware_width == 0 {
             1.0
@@ -314,23 +372,133 @@ fn content_uv_scale(width: u32, height: u32, hardware_width: u32, hardware_heigh
     )
 }
 
-fn passthrough(glium_ctx: &mut ffgl_glium::FFGLGlium, data: &FFGLData, frame_data: GLInput<'_>) {
-    use glium::Surface;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn passthrough(data: &FFGLData, frame_data: GLInput<'_>) {
+    use gpu_interop::shader_blit::ShaderBlit;
+
+    thread_local! {
+        static PASSTHROUGH_SHADER: RefCell<Option<ShaderBlit>> = const { RefCell::new(None) };
+    }
+
+    let Some(input) = frame_data.textures.first() else {
+        return;
+    };
     let (width, height) = data.get_dimensions();
-    glium_ctx.draw(
-        (width, height),
-        (width, height),
-        frame_data,
-        &mut |target, textures| {
-            if let Some(input_texture) = textures.first() {
-                input_texture
-                    .as_surface()
-                    .fill(target, glium::uniforms::MagnifySamplerFilter::Linear);
-            }
-            Ok(())
-        },
+    let uv_scale = content_uv_scale(
+        input.Width,
+        input.Height,
+        input.HardwareWidth,
+        input.HardwareHeight,
     );
+
+    unsafe {
+        let saved = SavedGlState::save();
+        let output_fbo = saved.draw_framebuffer.max(0) as GLuint;
+        let viewport = resolve_output_viewport(
+            saved.viewport,
+            [
+                data.viewport.x as i32,
+                data.viewport.y as i32,
+                width as i32,
+                height as i32,
+            ],
+        );
+
+        let mut read_fbo = 0;
+        gl::GenFramebuffers(1, &mut read_fbo);
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, read_fbo);
+
+        let mut attachable_target = None;
+        for target in [gl::TEXTURE_2D, gl::TEXTURE_RECTANGLE] {
+            gl::FramebufferTexture2D(
+                gl::READ_FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                target,
+                input.Handle,
+                0,
+            );
+            if gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE {
+                attachable_target = Some(target);
+                break;
+            }
+        }
+
+        if attachable_target.is_some() {
+            gl::ReadBuffer(gl::COLOR_ATTACHMENT0);
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, output_fbo);
+            saved.with_host_scissor(|| {
+                gl::BlitFramebuffer(
+                    0,
+                    0,
+                    input.Width as GLint,
+                    input.Height as GLint,
+                    viewport[0],
+                    viewport[1],
+                    viewport[0] + viewport[2],
+                    viewport[1] + viewport[3],
+                    gl::COLOR_BUFFER_BIT,
+                    gl::NEAREST,
+                );
+            });
+        } else {
+            let source_target =
+                [gl::TEXTURE_2D, gl::TEXTURE_RECTANGLE]
+                    .into_iter()
+                    .find(|target| {
+                        clear_gl_errors();
+                        gl::BindTexture(*target, input.Handle);
+                        gl::GetError() == gl::NO_ERROR
+                    });
+
+            if let Some(source_target) = source_target {
+                PASSTHROUGH_SHADER.with(|cell| {
+                    let mut shader = cell.borrow_mut();
+                    if shader
+                        .as_ref()
+                        .is_some_and(|candidate| !candidate.is_valid())
+                    {
+                        *shader = None;
+                    }
+                    if shader.is_none() {
+                        *shader = ShaderBlit::new();
+                    }
+                    if let Some(shader) = shader.as_ref() {
+                        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, output_fbo);
+                        saved.with_host_scissor(|| match source_target {
+                            gl::TEXTURE_2D => shader.present_2d_scaled(
+                                input.Handle,
+                                viewport[0],
+                                viewport[1],
+                                viewport[2] as u32,
+                                viewport[3] as u32,
+                                true,
+                                uv_scale,
+                            ),
+                            _ => shader.present_rect_scaled(
+                                input.Handle,
+                                input.HardwareWidth.max(input.Width),
+                                input.HardwareHeight.max(input.Height),
+                                viewport[0],
+                                viewport[1],
+                                viewport[2] as u32,
+                                viewport[3] as u32,
+                                true,
+                                uv_scale,
+                            ),
+                        });
+                    }
+                });
+            }
+        }
+
+        gl::DeleteFramebuffers(1, &read_fbo);
+        clear_gl_errors();
+        saved.restore();
+    }
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn passthrough(_data: &FFGLData, _frame_data: GLInput<'_>) {}
 
 // ---------------------------------------------------------------------------
 // macOS Metal draw path
@@ -344,8 +512,8 @@ mod metal_draw {
     thread_local! {
         static GPU_CTX: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
         static BRIDGE: RefCell<Option<GlMetalBridge>> = const { RefCell::new(None) };
-        static CACHED_BRIDGES: RefCell<HashMap<u64, GlMetalBridge>> = RefCell::new(HashMap::new());
-        static LAST_INSTANCE_ID: RefCell<Option<u64>> = const { RefCell::new(None) };
+        static CACHED_BRIDGES: RefCell<HashMap<(u64, usize), GlMetalBridge>> = RefCell::new(HashMap::new());
+        static LAST_RESOURCE_KEY: RefCell<Option<(u64, usize)>> = const { RefCell::new(None) };
         static GPU_INITIALIZED: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     }
 
@@ -359,31 +527,36 @@ mod metal_draw {
     }
 
     pub fn ensure_instance_resources(instance_id: u64) {
-        LAST_INSTANCE_ID.with(|cell| {
-            let mut id = cell.borrow_mut();
-            if *id != Some(instance_id) {
-                if let Some(previous_id) = *id {
+        for released_id in pending_release_snapshot() {
+            release_instance_resources(released_id);
+        }
+        let resource_key = (instance_id, GlMetalBridge::current_context_key());
+        LAST_RESOURCE_KEY.with(|cell| {
+            let mut key = cell.borrow_mut();
+            if *key != Some(resource_key) {
+                if let Some(previous_key) = *key {
                     if let Some(bridge) = BRIDGE.with(|bridge| bridge.borrow_mut().take()) {
                         CACHED_BRIDGES.with(|cache| {
-                            cache.borrow_mut().insert(previous_id, bridge);
+                            cache.borrow_mut().insert(previous_key, bridge);
                         });
                     }
                 }
-                let bridge = CACHED_BRIDGES.with(|cache| cache.borrow_mut().remove(&instance_id));
+                let bridge = CACHED_BRIDGES.with(|cache| cache.borrow_mut().remove(&resource_key));
                 BRIDGE.with(|slot| *slot.borrow_mut() = bridge);
-                *id = Some(instance_id);
+                *key = Some(resource_key);
             }
         });
     }
 
     pub fn release_instance_resources(instance_id: u64) {
-        let is_active = LAST_INSTANCE_ID.with(|last| *last.borrow() == Some(instance_id));
+        let resource_key = (instance_id, GlMetalBridge::current_context_key());
+        let is_active = LAST_RESOURCE_KEY.with(|last| *last.borrow() == Some(resource_key));
         if is_active {
             release_active_resources();
-            LAST_INSTANCE_ID.with(|last| *last.borrow_mut() = None);
+            LAST_RESOURCE_KEY.with(|last| *last.borrow_mut() = None);
         }
         CACHED_BRIDGES.with(|cache| {
-            cache.borrow_mut().remove(&instance_id);
+            cache.borrow_mut().remove(&resource_key);
         });
         GPU_INITIALIZED.with(|ids| {
             ids.borrow_mut().remove(&instance_id);
@@ -405,11 +578,7 @@ mod metal_draw {
         });
         if need_release {
             release_active_resources();
-            // A CGL context change invalidates every cached GL name. Rebuild
-            // the bridge and plugin pipelines as one ownership unit.
-            CACHED_BRIDGES.with(|cache| cache.borrow_mut().clear());
-            GPU_INITIALIZED.with(|ids| ids.borrow_mut().clear());
-            GPU_CTX.with(|ctx| *ctx.borrow_mut() = None);
+            LAST_RESOURCE_KEY.with(|last| *last.borrow_mut() = None);
         }
         true
     }
@@ -418,7 +587,6 @@ mod metal_draw {
     pub fn draw<P: GpuPlugin>(
         plugin: &mut P,
         instance_id: u64,
-        glium: &mut ffgl_glium::FFGLGlium,
         data: &FFGLData,
         frame_data: GLInput<'_>,
         frame_counter: u64,
@@ -428,7 +596,7 @@ mod metal_draw {
     ) {
         ensure_instance_resources(instance_id);
         if !validate_gl_state() {
-            passthrough(glium, data, frame_data);
+            passthrough(data, frame_data);
             return;
         }
 
@@ -456,7 +624,7 @@ mod metal_draw {
         });
 
         if !ctx_available {
-            passthrough(glium, data, frame_data);
+            passthrough(data, frame_data);
             return;
         }
 
@@ -466,7 +634,7 @@ mod metal_draw {
         let tex_id = match frame_data.textures.first() {
             Some(t) => t.Handle,
             None => {
-                passthrough(glium, data, frame_data);
+                passthrough(data, frame_data);
                 return;
             }
         };
@@ -481,7 +649,8 @@ mod metal_draw {
 
         let saved_state = unsafe { SavedGlState::save() };
         let output_fbo = saved_state.draw_framebuffer.max(0) as u32;
-        let output_viewport = resolve_output_viewport(saved_state.viewport,
+        let output_viewport = resolve_output_viewport(
+            saved_state.viewport,
             [
                 data.viewport.x as i32,
                 data.viewport.y as i32,
@@ -505,12 +674,8 @@ mod metal_draw {
                             // so we use Retained::retain on its raw pointer.
                             let device_ref = ctx.device.device();
                             let device_ptr = device_ref
-                                as *const objc2::runtime::ProtocolObject<
-                                    dyn objc2_metal::MTLDevice,
-                                >
-                                as *mut objc2::runtime::ProtocolObject<
-                                    dyn objc2_metal::MTLDevice,
-                                >;
+                                as *const objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>
+                                as *mut objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>;
                             // SAFETY: device_ptr points to a valid, live ObjC
                             // object. Retained::retain increments its refcount.
                             let device_retained =
@@ -657,7 +822,8 @@ mod metal_draw {
         }
 
         if !success {
-            passthrough(glium, data, frame_data);
+            log_pipeline_fallback_once();
+            passthrough(data, frame_data);
         }
     }
 }
@@ -674,8 +840,8 @@ mod dx11_draw {
     thread_local! {
         static GPU_CTX: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
         static BRIDGE: RefCell<Option<GlDx11Bridge>> = const { RefCell::new(None) };
-        static CACHED_BRIDGES: RefCell<HashMap<u64, GlDx11Bridge>> = RefCell::new(HashMap::new());
-        static LAST_INSTANCE_ID: RefCell<Option<u64>> = const { RefCell::new(None) };
+        static CACHED_BRIDGES: RefCell<HashMap<(u64, usize), GlDx11Bridge>> = RefCell::new(HashMap::new());
+        static LAST_RESOURCE_KEY: RefCell<Option<(u64, usize)>> = const { RefCell::new(None) };
         static GPU_INITIALIZED: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     }
 
@@ -689,31 +855,36 @@ mod dx11_draw {
     }
 
     pub fn ensure_instance_resources(instance_id: u64) {
-        LAST_INSTANCE_ID.with(|cell| {
-            let mut id = cell.borrow_mut();
-            if *id != Some(instance_id) {
-                if let Some(previous_id) = *id {
+        for released_id in pending_release_snapshot() {
+            release_instance_resources(released_id);
+        }
+        let resource_key = (instance_id, GlDx11Bridge::current_context_key());
+        LAST_RESOURCE_KEY.with(|cell| {
+            let mut key = cell.borrow_mut();
+            if *key != Some(resource_key) {
+                if let Some(previous_key) = *key {
                     if let Some(bridge) = BRIDGE.with(|bridge| bridge.borrow_mut().take()) {
                         CACHED_BRIDGES.with(|cache| {
-                            cache.borrow_mut().insert(previous_id, bridge);
+                            cache.borrow_mut().insert(previous_key, bridge);
                         });
                     }
                 }
-                let bridge = CACHED_BRIDGES.with(|cache| cache.borrow_mut().remove(&instance_id));
+                let bridge = CACHED_BRIDGES.with(|cache| cache.borrow_mut().remove(&resource_key));
                 BRIDGE.with(|slot| *slot.borrow_mut() = bridge);
-                *id = Some(instance_id);
+                *key = Some(resource_key);
             }
         });
     }
 
     pub fn release_instance_resources(instance_id: u64) {
-        let is_active = LAST_INSTANCE_ID.with(|last| *last.borrow() == Some(instance_id));
+        let resource_key = (instance_id, GlDx11Bridge::current_context_key());
+        let is_active = LAST_RESOURCE_KEY.with(|last| *last.borrow() == Some(resource_key));
         if is_active {
             release_active_resources();
-            LAST_INSTANCE_ID.with(|last| *last.borrow_mut() = None);
+            LAST_RESOURCE_KEY.with(|last| *last.borrow_mut() = None);
         }
         CACHED_BRIDGES.with(|cache| {
-            cache.borrow_mut().remove(&instance_id);
+            cache.borrow_mut().remove(&resource_key);
         });
         GPU_INITIALIZED.with(|ids| {
             ids.borrow_mut().remove(&instance_id);
@@ -735,12 +906,7 @@ mod dx11_draw {
         });
         if need_release {
             release_active_resources();
-            // A WGL context change invalidates the complete interop stack:
-            // cached registrations, the D3D device opened through WGL, and
-            // plugin pipelines created from that device must move together.
-            CACHED_BRIDGES.with(|cache| cache.borrow_mut().clear());
-            GPU_INITIALIZED.with(|ids| ids.borrow_mut().clear());
-            GPU_CTX.with(|ctx| *ctx.borrow_mut() = None);
+            LAST_RESOURCE_KEY.with(|last| *last.borrow_mut() = None);
         }
         true
     }
@@ -749,7 +915,6 @@ mod dx11_draw {
     pub fn draw<P: GpuPlugin>(
         plugin: &mut P,
         instance_id: u64,
-        glium: &mut ffgl_glium::FFGLGlium,
         data: &FFGLData,
         frame_data: GLInput<'_>,
         frame_counter: u64,
@@ -759,7 +924,7 @@ mod dx11_draw {
     ) {
         ensure_instance_resources(instance_id);
         if !validate_gl_state() {
-            passthrough(glium, data, frame_data);
+            passthrough(data, frame_data);
             return;
         }
 
@@ -786,7 +951,7 @@ mod dx11_draw {
         });
 
         if !ctx_available {
-            passthrough(glium, data, frame_data);
+            passthrough(data, frame_data);
             return;
         }
 
@@ -797,24 +962,21 @@ mod dx11_draw {
             BRIDGE.with(|bridge_cell| {
                 let mut bridge = bridge_cell.borrow_mut();
                 if bridge.is_none() {
-                    *bridge = GlDx11Bridge::new(
-                        ctx.device.device(),
-                        ctx.device.context(),
-                    );
+                    *bridge = GlDx11Bridge::new(ctx.device.device(), ctx.device.context());
                 }
                 bridge.is_some()
             })
         });
 
         if !bridge_available {
-            passthrough(glium, data, frame_data);
+            passthrough(data, frame_data);
             return;
         }
 
         let tex_id = match frame_data.textures.first() {
             Some(t) => t.Handle,
             None => {
-                passthrough(glium, data, frame_data);
+                passthrough(data, frame_data);
                 return;
             }
         };
@@ -829,7 +991,8 @@ mod dx11_draw {
 
         let saved_state = unsafe { SavedGlState::save() };
         let output_fbo = saved_state.draw_framebuffer.max(0) as u32;
-        let output_viewport = resolve_output_viewport(saved_state.viewport,
+        let output_viewport = resolve_output_viewport(
+            saved_state.viewport,
             [
                 data.viewport.x as i32,
                 data.viewport.y as i32,
@@ -973,7 +1136,8 @@ mod dx11_draw {
         }
 
         if !success {
-            passthrough(glium, data, frame_data);
+            log_pipeline_fallback_once();
+            passthrough(data, frame_data);
         }
     }
 }
@@ -1008,6 +1172,9 @@ pub fn release_instance_gl_resources(instance_id: u64) {
     #[cfg(target_os = "windows")]
     dx11_draw::release_instance_resources(instance_id);
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    queue_release(instance_id);
+
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = instance_id;
 }
@@ -1015,6 +1182,9 @@ pub fn release_instance_gl_resources(instance_id: u64) {
 /// Validate GL state before drawing. Returns `false` if the GL context is
 /// invalid and drawing should be skipped.
 pub fn validate_gl_state_before_draw() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    ensure_gl_loaded();
+
     #[cfg(target_os = "macos")]
     return metal_draw::validate_gl_state();
 
@@ -1039,7 +1209,6 @@ pub fn validate_gl_state_before_draw() -> bool {
 /// * `plugin` - The plugin instance implementing [`GpuPlugin`].
 /// * `instance_id` - Unique identifier for this plugin instance (for
 ///   thread-local resource tracking).
-/// * `glium` - The glium context (used for passthrough fallback).
 /// * `data` - Host-provided FFGL data (viewport dimensions, timing, etc).
 /// * `frame_data` - Host input textures and FBO.
 /// * `frame_counter` - Monotonically increasing frame counter.
@@ -1052,7 +1221,6 @@ pub fn validate_gl_state_before_draw() -> bool {
 pub fn draw_gpu_effect<P: GpuPlugin>(
     plugin: &mut P,
     instance_id: u64,
-    glium: &mut ffgl_glium::FFGLGlium,
     data: &FFGLData,
     frame_data: GLInput<'_>,
     frame_counter: u64,
@@ -1060,11 +1228,13 @@ pub fn draw_gpu_effect<P: GpuPlugin>(
     filter_quality: f32,
     metallib_bytes: &[u8],
 ) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    ensure_gl_loaded();
+
     #[cfg(target_os = "macos")]
     metal_draw::draw(
         plugin,
         instance_id,
-        glium,
         data,
         frame_data,
         frame_counter,
@@ -1077,7 +1247,6 @@ pub fn draw_gpu_effect<P: GpuPlugin>(
     dx11_draw::draw(
         plugin,
         instance_id,
-        glium,
         data,
         frame_data,
         frame_counter,
@@ -1096,7 +1265,7 @@ pub fn draw_gpu_effect<P: GpuPlugin>(
             filter_quality,
             metallib_bytes,
         );
-        passthrough(glium, data, frame_data);
+        passthrough(data, frame_data);
     }
 }
 
@@ -1118,7 +1287,206 @@ mod tests {
 
     #[test]
     fn padded_texture_uvs_exclude_hardware_padding() {
-        assert_eq!(content_uv_scale(1919, 1079, 1920, 1080), (1919.0 / 1920.0, 1079.0 / 1080.0));
+        assert_eq!(
+            content_uv_scale(1919, 1079, 1920, 1080),
+            (1919.0 / 1920.0, 1079.0 / 1080.0)
+        );
         assert_eq!(content_uv_scale(640, 480, 0, 0), (1.0, 1.0));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn release_requests_are_visible_across_threads() {
+        use super::{pending_release_snapshot, queue_release};
+
+        let instance_id = u64::MAX - 17;
+        std::thread::spawn(move || queue_release(instance_id))
+            .join()
+            .unwrap();
+        assert!(pending_release_snapshot().contains(&instance_id));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(deprecated)]
+    fn real_gl_passthrough_restores_host_state_and_honors_scissor() {
+        use super::{ensure_gl_loaded, passthrough};
+        use ffgl_core::ffi::{FFGLTextureStruct, FFGLViewportStruct};
+        use ffgl_core::inputs::{FFGLData, GLInput};
+        use gl::types::{GLint, GLuint};
+        use objc2_open_gl::{
+            CGLChoosePixelFormat, CGLContextObj, CGLCreateContext, CGLDestroyContext,
+            CGLDestroyPixelFormat, CGLError, CGLOpenGLProfile, CGLPixelFormatAttribute,
+            CGLSetCurrentContext,
+        };
+        use std::ptr::{self, NonNull};
+
+        struct ContextGuard(CGLContextObj);
+        impl Drop for ContextGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    CGLSetCurrentContext(ptr::null_mut());
+                    CGLDestroyContext(self.0);
+                }
+            }
+        }
+
+        let attributes = [
+            CGLPixelFormatAttribute::CGLPFAOpenGLProfile,
+            CGLPixelFormatAttribute(CGLOpenGLProfile::CGLOGLPVersion_GL4_Core.0),
+            CGLPixelFormatAttribute::CGLPFAAllowOfflineRenderers,
+            CGLPixelFormatAttribute(0),
+        ];
+        let mut pixel_format = ptr::null_mut();
+        let mut pixel_format_count = 0;
+        let choose_error = unsafe {
+            CGLChoosePixelFormat(
+                NonNull::new(attributes.as_ptr() as *mut _).unwrap(),
+                NonNull::new(&mut pixel_format).unwrap(),
+                NonNull::new(&mut pixel_format_count).unwrap(),
+            )
+        };
+        assert_eq!(choose_error, CGLError::NoError);
+
+        let mut context = ptr::null_mut();
+        let create_error = unsafe {
+            CGLCreateContext(
+                pixel_format,
+                ptr::null_mut(),
+                NonNull::new(&mut context).unwrap(),
+            )
+        };
+        unsafe { CGLDestroyPixelFormat(pixel_format) };
+        assert_eq!(create_error, CGLError::NoError);
+        unsafe { CGLSetCurrentContext(context) };
+        let _context = ContextGuard(context);
+        ensure_gl_loaded();
+
+        unsafe {
+            let source_pixels = [[255u8, 0, 0, 255]; 16];
+            let mut source_texture: GLuint = 0;
+            gl::GenTextures(1, &mut source_texture);
+            gl::BindTexture(gl::TEXTURE_2D, source_texture);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as GLint);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as GLint);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as GLint,
+                4,
+                4,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                source_pixels.as_ptr().cast(),
+            );
+
+            let mut output_texture: GLuint = 0;
+            let mut output_fbo: GLuint = 0;
+            gl::GenTextures(1, &mut output_texture);
+            gl::BindTexture(gl::TEXTURE_2D, output_texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as GLint,
+                8,
+                8,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                ptr::null(),
+            );
+            gl::GenFramebuffers(1, &mut output_fbo);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, output_fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                output_texture,
+                0,
+            );
+            assert_eq!(
+                gl::CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
+            gl::Disable(gl::SCISSOR_TEST);
+            gl::ColorMask(gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+            gl::ClearColor(1.0, 0.0, 1.0, 1.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, output_fbo);
+            gl::BindFramebuffer(gl::READ_FRAMEBUFFER, output_fbo);
+            gl::Viewport(2, 2, 4, 4);
+            gl::Scissor(3, 3, 2, 2);
+            gl::Enable(gl::SCISSOR_TEST);
+            gl::Enable(gl::BLEND);
+            gl::ColorMask(gl::TRUE, gl::FALSE, gl::TRUE, gl::FALSE);
+
+            let data = FFGLData::new(&FFGLViewportStruct {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            });
+            let texture = FFGLTextureStruct {
+                Width: 4,
+                Height: 4,
+                HardwareWidth: 4,
+                HardwareHeight: 4,
+                Handle: source_texture,
+            };
+            passthrough(
+                &data,
+                GLInput {
+                    textures: &[texture],
+                    host: output_fbo,
+                },
+            );
+
+            let mut draw_fbo = 0;
+            let mut read_fbo = 0;
+            let mut viewport = [0; 4];
+            let mut scissor = [0; 4];
+            let mut color_mask = [gl::FALSE; 4];
+            gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut draw_fbo);
+            gl::GetIntegerv(gl::READ_FRAMEBUFFER_BINDING, &mut read_fbo);
+            gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+            gl::GetIntegerv(gl::SCISSOR_BOX, scissor.as_mut_ptr());
+            gl::GetBooleanv(gl::COLOR_WRITEMASK, color_mask.as_mut_ptr());
+            assert_eq!(draw_fbo as GLuint, output_fbo);
+            assert_eq!(read_fbo as GLuint, output_fbo);
+            assert_eq!(viewport, [2, 2, 4, 4]);
+            assert_eq!(scissor, [3, 3, 2, 2]);
+            assert_ne!(gl::IsEnabled(gl::SCISSOR_TEST), 0);
+            assert_ne!(gl::IsEnabled(gl::BLEND), 0);
+            assert_eq!(color_mask, [gl::TRUE, gl::FALSE, gl::TRUE, gl::FALSE]);
+
+            gl::Disable(gl::SCISSOR_TEST);
+            gl::ColorMask(gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+            let mut output_pixels = [[0u8; 4]; 64];
+            gl::ReadPixels(
+                0,
+                0,
+                8,
+                8,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                output_pixels.as_mut_ptr().cast(),
+            );
+            for y in 0..8 {
+                for x in 0..8 {
+                    let expected = if (3..5).contains(&x) && (3..5).contains(&y) {
+                        [255, 0, 0, 255]
+                    } else {
+                        [255, 0, 255, 255]
+                    };
+                    assert_eq!(output_pixels[y * 8 + x], expected, "pixel ({x}, {y})");
+                }
+            }
+
+            gl::DeleteFramebuffers(1, &output_fbo);
+            gl::DeleteTextures(1, &output_texture);
+            gl::DeleteTextures(1, &source_texture);
+        }
     }
 }

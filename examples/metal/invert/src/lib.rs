@@ -8,12 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ffgl_core::handler::simplified::{SimpleFFGLHandler, SimpleFFGLInstance};
 use ffgl_core::info::{PluginInfo, PluginType};
 use ffgl_core::{FFGLData, GLInput};
-use ffgl_glium::FFGLGlium;
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 use ffgl_gpu::pipeline::RenderPipeline;
 use ffgl_gpu::plugin::GpuPlugin;
-use ffgl_gpu::{DrawInput, GpuContext, draw_gpu_effect};
+use ffgl_gpu::{draw_gpu_effect, DrawInput, GpuContext};
 
 /// Compiled Metal shader library, embedded at build time.
 #[cfg(target_os = "macos")]
@@ -22,7 +21,7 @@ const METALLIB_BYTES: &[u8] = ffgl_gpu::include_metallib!();
 #[cfg(not(target_os = "macos"))]
 const METALLIB_BYTES: &[u8] = &[];
 
-/// Inner GPU state, separate from the glium context to avoid double-borrow.
+/// GPU pipeline state.
 struct GpuState {
     pipeline: Option<RenderPipeline>,
 }
@@ -52,7 +51,9 @@ impl GpuPlugin for GpuState {
                 Err(_) => return,
             };
 
-            input.metal_bridge().store_command_buffer(pending.into_command_buffer());
+            input
+                .metal_bridge()
+                .store_command_buffer(pending.into_command_buffer());
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -67,7 +68,6 @@ unsafe impl Send for GpuState {}
 unsafe impl Sync for GpuState {}
 
 pub struct Invert {
-    glium: FFGLGlium,
     gpu: GpuState,
     frame_counter: u64,
     instance_id: u64,
@@ -84,9 +84,8 @@ impl Drop for Invert {
 }
 
 impl SimpleFFGLInstance for Invert {
-    fn new(inst_data: &FFGLData) -> Self {
+    fn new(_inst_data: &FFGLData) -> Self {
         Self {
-            glium: FFGLGlium::new(inst_data),
             gpu: GpuState { pipeline: None },
             frame_counter: 0,
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
@@ -109,7 +108,6 @@ impl SimpleFFGLInstance for Invert {
         draw_gpu_effect(
             &mut self.gpu,
             id,
-            &mut self.glium,
             data,
             frame_data,
             self.frame_counter,
